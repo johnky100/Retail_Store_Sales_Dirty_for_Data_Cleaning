@@ -1,0 +1,12 @@
+/* ------------------------------------------------------------
+   TÍTULOS Y NUMERACIÓN EN NEGRITA
+   ------------------------------------------------------------ */
+
+h1,
+h2,
+h3,
+h1 .header-section-number,
+h2 .header-section-number,
+h3 .header-section-number {
+  font-weight: bold !important;
+}

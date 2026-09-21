@@ -1,0 +1,26 @@
+# DATA DIRECTORY / CARPETA DE DATOS
+data_Retail_Store_Sales_Dirty_for_Data_Cleaning/
+
+# R / RSTUDIO
+.Rproj.user/
+.RData
+.Rhistory
+.Ruserdata
+
+# PYTHON
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# SYSTEM FILES
+.DS_Store
+Thumbs.db
+
+# TEMPORARY FILES
+*.tmp
+*.log
+
+# RSTUDIO PUBLISHING METADATA / METADATOS DE PUBLICACIÓN RSTUDIO
+rsconnect/

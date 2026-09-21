@@ -1,0 +1,2186 @@
+---
+title: "02_imputacion_retail"
+author: "John Jairo Prado"
+date: "`r format(Sys.Date(), '%d/%m/%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    toc_float:
+      collapsed: false
+    css: styles.css
+editor_options:
+  chunk_output_type: console
+---
+
+<style>
+body {
+  background-color: #F5F5F5;
+  color: #333333;
+  font-size: 16px;
+}
+
+pre {
+  font-size: 14px;
+}
+
+h1 {
+  font-size: 22px;
+}
+
+h2 {
+  font-size: 19px;
+}
+
+h3 {
+  font-size: 17px;
+}
+
+table {
+  width: 100%;
+  font-size: 14px;
+}
+
+code {
+  font-size: 14px;
+}
+</style>
+
+## **Process Description / Descripción del proceso** {-}
+
+### **English** {-}
+
+This stage continues the data-quality and deterministic-cleaning process previously performed in Python. During that stage, missing values in `Item` and `Price Per Unit` were recovered using validated relationships between the variables.
+
+Three variables still contain missing values: `Quantity`, `Total Spent`, and `Discount Applied`. However, they do not represent three independent imputation problems.
+
+`Quantity` requires statistical imputation because its missing values cannot be recovered deterministically from the available information. Once `Quantity` has been estimated, the corresponding missing values of `Total Spent` can be reconstructed exactly through the validated business relationship:
+
+\[
+\text{Total Spent} =
+\text{Price Per Unit} \times \text{Quantity}
+\]
+
+Therefore, `Total Spent` will not be statistically imputed.
+
+`Discount Applied` constitutes a separate binary missing-data problem and will be evaluated independently.
+
+The methodological strategy is therefore:
+
+1. statistically impute `Quantity`;
+2. reconstruct `Total Spent` deterministically;
+3. statistically impute `Discount Applied`;
+4. preserve all originally observed values;
+5. validate the resulting distributions and business rules.
+
+For `Quantity`, Predictive Mean Matching (PMM), CART, and Random Forest will be compared. For `Discount Applied`, logistic regression, CART, and Random Forest will be evaluated.
+
+Candidate methods will be compared through artificial masking of observed values before being applied to genuinely missing observations.
+
+The objective is not simply to eliminate missing values, but to obtain results that are statistically defensible, reproducible, traceable, and consistent with the validated business rules.
+
+---
+
+### **Español** {-}
+
+Esta etapa continúa el proceso de calidad de datos y limpieza determinística realizado previamente en Python. Durante esa fase se recuperaron los valores faltantes de `Item` y `Price Per Unit` mediante relaciones previamente validadas entre las variables.
+
+Todavía existen valores faltantes en `Quantity`, `Total Spent` y `Discount Applied`. Sin embargo, estas tres variables no representan tres problemas independientes de imputación.
+
+`Quantity` requiere imputación estadística porque sus valores faltantes no pueden recuperarse determinísticamente con la información disponible. Una vez estimada `Quantity`, los valores faltantes correspondientes de `Total Spent` pueden reconstruirse exactamente mediante la relación de negocio previamente validada:
+
+\[
+\text{Total Spent} =
+\text{Price Per Unit} \times \text{Quantity}
+\]
+
+Por tanto, `Total Spent` no será imputada estadísticamente.
+
+`Discount Applied` constituye un problema independiente de datos faltantes de naturaleza binaria y será analizada por separado.
+
+La estrategia metodológica será:
+
+1. imputar estadísticamente `Quantity`;
+2. reconstruir determinísticamente `Total Spent`;
+3. imputar estadísticamente `Discount Applied`;
+4. preservar todos los valores originalmente observados;
+5. validar las distribuciones resultantes y las reglas de negocio.
+
+Para `Quantity` se compararán Predictive Mean Matching (PMM), CART y Random Forest. Para `Discount Applied` se evaluarán regresión logística, CART y Random Forest.
+
+Los métodos candidatos serán comparados mediante enmascaramiento artificial de valores observados antes de aplicarlos sobre los valores realmente faltantes.
+
+El objetivo no consiste simplemente en eliminar valores faltantes, sino en obtener resultados estadísticamente justificables, reproducibles, trazables y coherentes con las reglas de negocio previamente validadas.
+
+## **Clean R session / Limpiar sesión de R** {-}
+
+```{r clear-R-session}
+
+# CLEAN R SESSION / LIMPIAR SESIÓN DE R
+# ------------------------------------------------------------
+
+rm(list = ls()) # Removes all objects from the R environment / Elimina todos los objetos del entorno de R
+graphics.off() # Closes all active graphics devices / Cierra todos los dispositivos gráficos activos
+cat("\014") # Clears the RStudio console / Limpia la consola de RStudio
+
+```
+
+# **LOAD PACKAGES AND DATA / CARGAR PAQUETES Y DATOS**
+
+```{r load-packages}
+
+# LOAD PACKAGES AND DATA / CARGAR PAQUETES Y DATOS
+# ------------------------------------------------------------
+
+# install.packages('DT')
+# install.packages(c("rpart", "randomForest"))
+# LOAD REQUIRED PACKAGES / CARGAR PAQUETES REQUERIDOS
+# ------------------------------------------------------------
+
+library(arrow) # Reads and writes Parquet files / Lee y escribe archivos Parquet
+library(tidyverse) # Provides data manipulation and visualization tools / Proporciona herramientas de manipulación y visualización de datos
+library(mice) # Implements statistical imputation methods / Implementa métodos de imputación estadística
+library(DT) # Creates interactive tables / Crea tablas interactivas
+library(writexl) # Writes Excel XLSX files / Escribe archivos Excel XLSX
+library(randomForest) # Implements Random Forest models / Implementa modelos Random Forest
+
+
+# VERIFY MODELING PACKAGES / VERIFICAR PAQUETES DE MODELADO
+# ------------------------------------------------------------
+
+cat("rpart available / rpart disponible:", requireNamespace("rpart", quietly = TRUE), "\n")
+cat("rpart version / Versión rpart:", as.character(packageVersion("rpart")), "\n")
+cat("randomForest available / randomForest disponible:", requireNamespace("randomForest", quietly = TRUE), "\n")
+cat("randomForest version / Versión randomForest:", as.character(packageVersion("randomForest")), "\n")
+
+cat("Packages loaded successfully / Paquetes cargados correctamente.\n") # Confirms that the required libraries were loaded / Confirma la carga de las librerías necesarias
+
+```
+
+# **DEFINE FILE PATH / DEFINIR RUTA DEL ARCHIVO**
+
+```{r file-path}
+
+# DEFINE FILE PATH / DEFINIR RUTA DEL ARCHIVO
+# ------------------------------------------------------------
+
+ruta_datos <- "data/processed/retail_sales_pre_imputation.parquet" # Defines the file generated after deterministic cleaning in Python / Define el archivo generado después de la limpieza determinística en Python
+
+if (!file.exists(ruta_datos)) stop("ERROR: retail_sales_pre_imputation.parquet was not found / no se encontró retail_sales_pre_imputation.parquet.") # Stops execution if the file does not exist / Detiene la ejecución si el archivo no existe
+
+cat("File located successfully / Archivo localizado correctamente:", ruta_datos, "\n") # Confirms the file path used / Confirma la ruta del archivo utilizada
+```
+
+# **LOAD DATA / CARGAR DATOS**
+
+```{r load-data}
+
+# LOAD DATA / CARGAR DATOS
+# ------------------------------------------------------------
+
+datos_raw <- arrow::read_parquet(ruta_datos) # Imports the result of the deterministic cleaning performed in Python / Importa el resultado de la limpieza determinística realizada en Python
+
+datos <- datos_raw # Creates the working dataset while preserving the imported dataset unchanged / Crea el objeto de trabajo y conserva intacto el dataset importado
+
+cat("Records / Registros:", format(nrow(datos), big.mark = ".", decimal.mark = ",", scientific = FALSE), "\n") # Reports the number of records / Informa el número de registros
+cat("Variables / Variables:", ncol(datos), "\n") # Reports the number of variables / Informa el número de variables
+cat("Missing values / Valores faltantes:", sum(is.na(datos)), "\n") # Reports the initial total number of missing values / Informa el total inicial de valores faltantes
+
+```
+
+# **DIAGNOSE MISSING VALUES / DIAGNOSTICAR VALORES FALTANTES**
+
+```{r diagnose-missing-values}
+
+# DIAGNOSE MISSING VALUES / DIAGNOSTICAR VALORES FALTANTES
+# ------------------------------------------------------------
+
+tabla_faltantes <- tibble::tibble(
+  Variable = names(datos), # Records each dataset variable / Registra cada variable del dataset
+  Faltantes = vapply(datos, function(x) sum(is.na(x)), integer(1)), # Counts missing values / Cuenta los valores faltantes
+  Porcentaje = vapply(datos, function(x) mean(is.na(x)) * 100, numeric(1)) # Calculates the percentage of missing values / Calcula el porcentaje de valores faltantes
+) %>%
+  dplyr::filter(Faltantes > 0) %>% # Keeps only variables with missing values / Conserva únicamente las variables que presentan valores faltantes
+  dplyr::arrange(dplyr::desc(Porcentaje)) # Sorts from highest to lowest percentage of missing values / Ordena de mayor a menor porcentaje de valores faltantes
+
+tabla_faltantes # Displays the initial missing-data diagnosis / Presenta el diagnóstico inicial de datos faltantes
+
+```
+
+### **g01. Missing values by variable / Valores faltantes por variable** {-}
+
+```{r g01-missing-values-variable}
+
+# G01. MISSING VALUES BY VARIABLE / VALORES FALTANTES POR VARIABLE
+# ------------------------------------------------------------
+
+grafico_faltantes <- ggplot2::ggplot(
+  tabla_faltantes,
+  ggplot2::aes(x = reorder(Variable, Porcentaje), y = Porcentaje)
+) +
+  ggplot2::geom_col(width = 0.65) + # Represents the percentage of missing values for each variable / Representa el porcentaje de valores faltantes de cada variable
+  ggplot2::geom_text(
+    ggplot2::aes(label = paste0(Faltantes, " (", sprintf("%.1f", Porcentaje), "%)")),
+    hjust = -0.10,
+    size = 4
+  ) + # Displays the number and percentage of missing values / Muestra el número y porcentaje de valores faltantes
+  ggplot2::coord_flip() + # Uses horizontal bars to improve readability / Utiliza barras horizontales para facilitar la lectura
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(tabla_faltantes$Porcentaje) * 1.25),
+    labels = function(x) paste0(x, "%")
+  ) + # Formats the scale as percentages / Formatea la escala como porcentaje
+  ggplot2::labs(
+    title = "MISSING VALUES BY VARIABLE / VALORES FALTANTES POR VARIABLE",
+    subtitle = "BEFORE STATISTICAL IMPUTATION / ANTES DE LA IMPUTACIÓN ESTADÍSTICA",
+    x = NULL,
+    y = "MISSING VALUES (%) / VALORES FALTANTES (%)"
+  ) + # Defines bilingual chart labels / Define las etiquetas bilingües del gráfico
+  ggplot2::theme_minimal(base_size = 12) + # Applies a clean report theme / Aplica un tema limpio para el informe
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold"),
+    plot.subtitle = ggplot2::element_text(face = "bold"),
+    axis.title = ggplot2::element_text(face = "bold")
+  ) # Highlights the main chart text / Resalta los textos principales del gráfico
+
+print(grafico_faltantes) # Explicitly renders the chart / Renderiza explícitamente el gráfico
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The dataset contains 12,575 records and 11 variables, with 5,407 missing values before statistical imputation. Missingness is concentrated in three variables: Discount Applied has 4,199 missing values (33.4%), while Quantity and Total Spent each contain 604 missing values (4.8%). Therefore, Discount Applied represents the main source of missing data in terms of magnitude. The identical missing-value counts for Quantity and Total Spent suggest a potentially related missingness pattern; however, row-level correspondence must be verified before establishing the recovery strategy.
+
+---
+
+**Español** {-}
+
+El conjunto de datos contiene 12.575 registros y 11 variables, con 5.407 valores faltantes antes de la imputación estadística. Los faltantes se concentran en tres variables: Discount Applied presenta 4.199 valores faltantes (33,4 %), mientras que Quantity y Total Spent contienen 604 valores faltantes cada una (4,8 %). Por tanto, Discount Applied constituye la principal fuente de datos faltantes en términos de magnitud. La igualdad en el número de faltantes de Quantity y Total Spent sugiere un posible patrón relacionado; sin embargo, es necesario comprobar su correspondencia fila a fila antes de establecer la estrategia de recuperación.
+
+
+## **Verify quantity and total spent missingness / Verificar faltantes de quantity y total spent**
+
+```{r}
+
+# VERIFY QUANTITY AND TOTAL SPENT MISSINGNESS / VERIFICAR FALTANTES DE QUANTITY Y TOTAL SPENT
+# ------------------------------------------------------------
+
+indices_quantity_faltante <- is.na(datos$Quantity) # Identifies records with missing Quantity / Identifica los registros con Quantity faltante
+
+indices_total_faltante <- is.na(datos$`Total Spent`) # Identifies records with missing Total Spent / Identifica los registros con Total Spent faltante
+
+patrones_coinciden <- identical(indices_quantity_faltante, indices_total_faltante) # Checks whether Quantity and Total Spent are missing in exactly the same records / Comprueba si Quantity y Total Spent faltan exactamente en los mismos registros
+
+precios_disponibles <- all(!is.na(datos$`Price Per Unit`[indices_quantity_faltante])) # Checks whether Price Per Unit is available for all records requiring Quantity imputation / Comprueba si Price Per Unit está disponible en todos los registros que requieren imputar Quantity
+
+cat("Missing Quantity / Quantity faltantes:", sum(indices_quantity_faltante), "\n") # Reports the number of missing Quantity values / Informa el número de valores faltantes de Quantity
+cat("Missing Total Spent / Total Spent faltantes:", sum(indices_total_faltante), "\n") # Reports the number of missing Total Spent values / Informa el número de valores faltantes de Total Spent
+cat("Missingness patterns match / Los patrones de faltantes coinciden:", patrones_coinciden, "\n") # Reports whether both variables are missing in the same records / Informa si ambas variables faltan en los mismos registros
+cat("Price Per Unit available / Price Per Unit disponible:", precios_disponibles, "\n") # Reports whether prices are available for subsequent Total Spent reconstruction / Informa si los precios están disponibles para reconstruir posteriormente Total Spent
+
+if (!patrones_coinciden) stop("ERROR: Quantity and Total Spent do not share the same missingness pattern / Quantity y Total Spent no presentan el mismo patrón de faltantes.") # Stops the process if the missingness patterns differ / Detiene el proceso si los patrones de faltantes son diferentes
+
+if (!precios_disponibles) stop("ERROR: missing Price Per Unit values prevent deterministic reconstruction of Total Spent / existen valores faltantes de Price Per Unit que impiden reconstruir Total Spent.") # Stops the process if prices required for reconstruction are unavailable / Detiene el proceso si no están disponibles los precios necesarios para la reconstrucción
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The missing-data analysis confirms that Quantity and Total Spent contain exactly 604 missing values (4.8%), occurring in the same records. In addition, Price Per Unit is available for all affected observations. This supports a sequential recovery strategy in which only Quantity requires statistical imputation. Once Quantity is recovered, the corresponding missing values of Total Spent can be reconstructed deterministically using Total Spent = Price Per Unit × Quantity. This approach avoids unnecessary statistical imputation and preserves the business relationship among the variables.
+
+---
+
+**Español** {-}
+
+El análisis de datos faltantes confirma que Quantity y Total Spent contienen exactamente 604 valores faltantes (4,8 %) y que estos se encuentran en los mismos registros. Además, Price Per Unit está disponible en todas las observaciones afectadas. Esto sustenta una estrategia secuencial en la que únicamente Quantity requiere imputación estadística. Una vez recuperada Quantity, los valores faltantes correspondientes de Total Spent pueden reconstruirse de forma determinística mediante Total Spent = Price Per Unit × Quantity. Este enfoque evita una imputación estadística innecesaria y preserva la relación de negocio existente entre las variables.
+
+# **QUANTITY IMPUTATION VARIABLES/IMPUTACIÓN DE VARIABLE QUANTITY**
+
+## **Prepare temporal variables / Preparar variables temporales**
+
+```{r prepare-temporal-variables}
+
+# PREPARE TEMPORAL VARIABLES / PREPARAR VARIABLES TEMPORALES
+# ------------------------------------------------------------
+
+datos <- datos %>%
+  dplyr::mutate(
+    `Transaction Date` = as.Date(`Transaction Date`), # Converts Transaction Date to Date format / Convierte Transaction Date al formato Date
+    Anio = lubridate::year(`Transaction Date`), # Extracts the transaction year as a temporal predictor / Extrae el año de la transacción como predictor temporal
+    Mes = lubridate::month(`Transaction Date`) # Extracts the transaction month as a temporal predictor / Extrae el mes de la transacción como predictor temporal
+  )
+
+cat("Year missing values / Valores faltantes de Anio:", sum(is.na(datos$Anio)), "\n") # Checks missing values in the derived year / Comprueba los valores faltantes en el año derivado
+cat("Month missing values / Valores faltantes de Mes:", sum(is.na(datos$Mes)), "\n") # Checks missing values in the derived month / Comprueba los valores faltantes en el mes derivado
+cat("Date range / Rango de fechas:", format(min(datos$`Transaction Date`, na.rm = TRUE), "%d/%m/%Y"), "-", format(max(datos$`Transaction Date`, na.rm = TRUE), "%d/%m/%Y"), "\n") # Reports the transaction date range / Informa el rango de fechas de las transacciones
+
+```
+
+## **Define quantity imputation variables / Definir variables para la imputación de quantity**
+
+```{r quantity-imputation-variables}
+
+# DEFINE QUANTITY IMPUTATION VARIABLES / DEFINIR VARIABLES PARA LA IMPUTACIÓN DE QUANTITY
+# ------------------------------------------------------------
+
+predictoras_quantity <- c("Item", "Payment Method", "Location", "Anio", "Mes") # Defines the predictors used to estimate Quantity / Define los predictores utilizados para estimar Quantity
+
+variables_quantity <- c("Quantity", predictoras_quantity) # Combines the target variable and its predictors / Combina la variable objetivo y sus predictores
+
+datos_quantity <- datos %>%
+  dplyr::select(dplyr::all_of(variables_quantity)) # Creates the modeling dataset for Quantity / Crea el conjunto de datos utilizado para modelar Quantity
+
+cat("Modeling records / Registros para modelado:", nrow(datos_quantity), "\n") # Reports the number of modeling records / Informa el número de registros para modelado
+cat("Modeling variables / Variables para modelado:", ncol(datos_quantity), "\n") # Reports the number of modeling variables / Informa el número de variables para modelado
+cat("Missing Quantity / Quantity faltantes:", sum(is.na(datos_quantity$Quantity)), "\n") # Reports the number of Quantity values requiring imputation / Informa los valores de Quantity que requieren imputación
+cat("Predictors / Predictores:", paste(predictoras_quantity, collapse = ", "), "\n") # Displays the selected predictors / Presenta los predictores seleccionados
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-} 
+
+The modeling dataset for Quantity contains 12,575 records and 6 variables, with 604 missing values requiring imputation. Five predictors were selected: Item, Payment Method, Location, Anio, and Mes. This configuration isolates Quantity as the target variable while incorporating product, payment, location, and temporal information. The resulting dataset provides the defined structure for evaluating and applying the statistical imputation methods.
+
+**Español** {-}
+
+El conjunto de datos para el modelado de Quantity contiene 12.575 registros y 6 variables, con 604 valores faltantes que requieren imputación. Se seleccionaron cinco predictores: Item, Payment Method, Location, Anio y Mes. Esta configuración permite mantener Quantity como variable objetivo e incorporar información relacionada con el producto, el método de pago, la ubicación y el componente temporal. El conjunto resultante proporciona la estructura definida para evaluar y aplicar los métodos de imputación estadística.
+
+
+## **Validate quantity predictors / validar predictores de quantity**
+
+```{r Validate-quantity-predictors}
+
+# VALIDATE QUANTITY PREDICTORS / VALIDAR PREDICTORES DE QUANTITY
+# ------------------------------------------------------------
+
+faltantes_predictoras_quantity <- datos_quantity %>%
+  dplyr::select(dplyr::all_of(predictoras_quantity)) %>% # Selects only the predictors used for Quantity imputation / Selecciona únicamente los predictores utilizados para imputar Quantity
+  dplyr::summarise(
+    dplyr::across(dplyr::everything(), ~ sum(is.na(.x)))
+  ) %>% # Counts missing values in each predictor / Cuenta los valores faltantes de cada predictor
+  tidyr::pivot_longer(
+    cols = dplyr::everything(),
+    names_to = "Variable",
+    values_to = "Faltantes"
+  ) # Converts the result to a long-format diagnostic table / Convierte el resultado en una tabla diagnóstica de formato largo
+
+faltantes_predictoras_quantity # Displays the number of missing values in each predictor / Presenta el número de valores faltantes de cada predictor
+
+if (any(faltantes_predictoras_quantity$Faltantes > 0)) stop("ERROR: selected predictors contain missing values / los predictores seleccionados contienen valores faltantes.") # Stops execution if any predictor contains missing values / Detiene la ejecución si algún predictor contiene valores faltantes
+
+cat("Predictors validated successfully / Predictores validados correctamente.\n") # Confirms that all selected predictors are complete / Confirma que todos los predictores seleccionados están completos
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The validation confirms that all five predictors selected for Quantity imputation—Item, Payment Method, Location, Anio, and Mes—are complete, with zero missing values. Therefore, the predictor set is suitable for the subsequent imputation process without requiring additional treatment of missing predictor values.
+
+**Español** {-}
+
+La validación confirma que los cinco predictores seleccionados para la imputación de Quantity—Item, Payment Method, Location, Anio y Mes—están completos y presentan cero valores faltantes. Por tanto, el conjunto de predictores es adecuado para continuar con el proceso de imputación sin necesidad de realizar tratamientos adicionales sobre valores faltantes en las variables predictoras.
+
+
+## **Create artificial validation sample / Crear muestra de validación artificial**
+
+```{r Create-artificial-validation-sample}
+
+# CREATE ARTIFICIAL VALIDATION SAMPLE / CREAR MUESTRA DE VALIDACIÓN ARTIFICIAL
+# ------------------------------------------------------------
+
+semilla_validacion <- 5477976 # Defines a fixed seed to ensure reproducibility / Define una semilla fija para garantizar la reproducibilidad
+
+proporcion_validacion <- 0.10 # Defines 10% of observed Quantity values for validation / Define el 10 % de los valores observados de Quantity para validación
+
+indices_quantity_observados <- which(!is.na(datos_quantity$Quantity)) # Identifies records with observed Quantity values / Identifica los registros con valores observados de Quantity
+
+numero_validacion <- round(length(indices_quantity_observados) * proporcion_validacion) # Calculates the number of observations to hide artificially / Calcula el número de observaciones que se ocultarán artificialmente
+
+set.seed(semilla_validacion) # Sets the random seed before sampling / Establece la semilla aleatoria antes del muestreo
+
+indices_validacion <- sample(indices_quantity_observados, size = numero_validacion, replace = FALSE) # Randomly selects observed Quantity values for validation / Selecciona aleatoriamente valores observados de Quantity para validación
+
+valores_reales_quantity <- datos_quantity$Quantity[indices_validacion] # Stores the true Quantity values before hiding them / Guarda los valores reales de Quantity antes de ocultarlos
+
+datos_quantity_validacion <- datos_quantity # Creates an independent dataset for artificial validation / Crea un conjunto de datos independiente para la validación artificial
+
+datos_quantity_validacion$Quantity[indices_validacion] <- NA # Artificially hides selected observed Quantity values / Oculta artificialmente los valores seleccionados de Quantity
+
+cat("Observed Quantity before masking / Quantity observados antes del enmascaramiento:", length(indices_quantity_observados), "\n") # Reports the original number of observed values / Informa el número original de valores observados
+cat("Artificial validation cases / Casos de validación artificial:", length(indices_validacion), "\n") # Reports the number of artificially hidden values / Informa el número de valores ocultados artificialmente
+cat("Original missing Quantity / Quantity faltantes originales:", sum(is.na(datos_quantity$Quantity)), "\n") # Reports the original missing values / Informa los valores faltantes originales
+cat("Missing Quantity during validation / Quantity faltantes durante la validación:", sum(is.na(datos_quantity_validacion$Quantity)), "\n") # Reports total missing values after artificial masking / Informa el total de faltantes después del enmascaramiento artificial
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The artificial validation sample was successfully created from the observed Quantity values. Of the 11,971 originally observed values, 1,197 (10%) were randomly selected and temporarily masked using a fixed seed to ensure reproducibility. Together with the 604 original missing values, this produced 1,801 missing values during validation. The true values of the 1,197 masked observations were preserved, allowing subsequent imputation methods to be objectively evaluated by comparing their estimates against known values.
+
+**Español** {-}
+
+La muestra de validación artificial se creó correctamente a partir de los valores observados de Quantity. De los 11.971 valores originalmente observados, se seleccionaron aleatoriamente y ocultaron temporalmente 1.197 (10 %), utilizando una semilla fija para garantizar la reproducibilidad. Al sumarlos a los 604 valores faltantes originales, se obtuvieron 1.801 valores faltantes durante la validación. Los valores reales de las 1.197 observaciones ocultadas fueron conservados, lo que permitirá evaluar objetivamente los métodos de imputación mediante la comparación entre los valores imputados y los valores reales conocidos.
+
+# **Validate artificial masking / Validar enmascaramiento artificial**
+
+```{r validate-artificial-masking}
+
+# VALIDATE ARTIFICIAL MASKING / VALIDAR ENMASCARAMIENTO ARTIFICIAL
+# ------------------------------------------------------------
+
+cantidad_originales_preservados <- sum(is.na(datos_quantity$Quantity) & is.na(datos_quantity_validacion$Quantity)) # Counts the original missing values that remain missing / Cuenta los valores faltantes originales que permanecen como faltantes
+
+cantidad_ocultados_correctamente <- sum(!is.na(datos_quantity$Quantity) & is.na(datos_quantity_validacion$Quantity)) # Counts the observed values artificially hidden for validation / Cuenta los valores observados ocultados artificialmente para validación
+
+valores_reales_preservados <- identical(valores_reales_quantity, datos_quantity$Quantity[indices_validacion]) # Verifies that the true validation values were preserved / Verifica que los valores reales de validación fueron conservados
+
+cat("Original missing values preserved / Faltantes originales preservados:", cantidad_originales_preservados, "\n") # Reports the preserved original missing values / Informa los faltantes originales preservados
+cat("Artificially masked values / Valores ocultados artificialmente:", cantidad_ocultados_correctamente, "\n") # Reports the artificially hidden values / Informa los valores ocultados artificialmente
+cat("True validation values preserved / Valores reales de validación preservados:", valores_reales_preservados, "\n") # Confirms preservation of the true values / Confirma la conservación de los valores reales
+
+if (cantidad_originales_preservados != sum(is.na(datos_quantity$Quantity))) stop("ERROR: original Quantity missing values were modified / los valores faltantes originales de Quantity fueron modificados.") # Stops if the original missingness was altered / Detiene el proceso si se alteraron los faltantes originales
+
+if (cantidad_ocultados_correctamente != numero_validacion) stop("ERROR: artificial masking is inconsistent / el enmascaramiento artificial es inconsistente.") # Stops if the validation sample is inconsistent / Detiene el proceso si la muestra de validación es inconsistente
+
+if (!valores_reales_preservados) stop("ERROR: true validation values were not preserved / los valores reales de validación no fueron preservados.") # Stops if the ground-truth values were lost / Detiene el proceso si se perdieron los valores reales
+
+```
+
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The artificial masking validation was completed successfully. The 604 original missing Quantity values remained unchanged, while the 1,197 observed values selected for validation were correctly masked. In addition, the original values of these 1,197 observations were fully preserved (TRUE), providing a reliable reference for evaluating the imputation methods. Therefore, the validation dataset maintains a clear separation between the real missing values and the artificially masked values, ensuring a reproducible and controlled evaluation of imputation performance.
+
+**Español** {-}
+
+La validación del enmascaramiento artificial se completó correctamente. Los 604 valores faltantes originales de Quantity permanecieron sin modificaciones, mientras que los 1.197 valores observados seleccionados para validación fueron ocultados correctamente. Además, los valores originales de estas 1.197 observaciones se conservaron completamente (TRUE), proporcionando una referencia confiable para evaluar los métodos de imputación. Por tanto, el conjunto de validación mantiene una separación clara entre los valores faltantes reales y los valores ocultados artificialmente, garantizando una evaluación controlada y reproducible del desempeño de los métodos de imputación.
+
+## **Configure mice for quantity / Configurar mice para quantity**
+
+```{r configure-mice-quantity}
+
+# CONFIGURE MICE FOR QUANTITY / CONFIGURAR MICE PARA QUANTITY
+# ------------------------------------------------------------
+
+configuracion_inicial <- mice::mice(
+  datos_quantity_validacion,
+  maxit = 0,
+  printFlag = FALSE
+) # Initializes MICE without performing imputations to obtain its default configuration / Inicializa MICE sin realizar imputaciones para obtener su configuración predeterminada
+
+metodo_quantity <- configuracion_inicial$method # Extracts the default imputation methods / Extrae los métodos de imputación predeterminados
+
+matriz_quantity <- configuracion_inicial$predictorMatrix # Extracts the default predictor matrix / Extrae la matriz de predictores predeterminada
+
+metodo_quantity[] <- "" # Disables imputation for all variables initially / Desactiva inicialmente la imputación para todas las variables
+
+metodo_quantity["Quantity"] <- "pmm" # Temporarily assigns PMM to Quantity for the technical test / Asigna temporalmente PMM a Quantity para la prueba técnica
+
+matriz_quantity[,] <- 0 # Removes all predictor relationships before defining the desired model / Elimina todas las relaciones de predicción antes de definir el modelo deseado
+
+matriz_quantity["Quantity", predictoras_quantity] <- 1 # Uses the five selected variables exclusively as predictors of Quantity / Utiliza exclusivamente las cinco variables seleccionadas como predictores de Quantity
+
+matriz_quantity["Quantity", "Quantity"] <- 0 # Ensures that Quantity cannot predict itself / Garantiza que Quantity no pueda predecirse a sí misma
+
+cat("Method for Quantity / Método para Quantity:", metodo_quantity["Quantity"], "\n") # Reports the method assigned for the technical test / Informa el método asignado para la prueba técnica
+cat("Number of Quantity predictors / Número de predictores de Quantity:", sum(matriz_quantity["Quantity", ]), "\n") # Reports the number of active predictors / Informa el número de predictores activos
+
+matriz_quantity["Quantity", , drop = FALSE] # Displays the final predictor configuration for Quantity / Presenta la configuración final de predictores para Quantity
+
+```
+
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The MICE configuration for Quantity was successfully established. PMM was initially assigned as the imputation method, and a customized predictor matrix was defined using the five selected predictors: Item, Payment Method, Location, Anio, and Mes. Quantity was correctly excluded from predicting itself, while no other variables were configured for imputation. Although MICE reported three logged events during initialization, the manually specified predictor structure was successfully created and subsequently used for the comparative evaluation of the candidate methods.
+
+**Español** {-}
+
+La configuración de MICE para Quantity se estableció correctamente. Inicialmente se asignó PMM como método de imputación y se definió una matriz de predictores personalizada utilizando los cinco predictores seleccionados: Item, Payment Method, Location, Anio y Mes. Quantity fue excluida correctamente como predictor de sí misma y ninguna otra variable fue configurada para ser imputada. Aunque MICE registró tres eventos durante la inicialización, la estructura de predictores definida manualmente se creó correctamente y posteriormente pudo utilizarse para la evaluación comparativa de los métodos candidatos.
+
+# **COMPARE QUANTITY IMPUTATION METHODS / COMPARAR MÉTODOS DE IMPUTACIÓN DE QUANTITY**
+
+## **Define candidate imputation methods / Definir métodos candidatos de imputación**
+
+```{r Define-candidate-imputation-methods}
+
+# DEFINE CANDIDATE IMPUTATION METHODS / DEFINIR MÉTODOS CANDIDATOS DE IMPUTACIÓN
+# ------------------------------------------------------------
+
+metodos_quantity_comparacion <- c(
+  PMM = "pmm",
+  CART = "cart",
+  RF = "rf"
+) # Defines the three candidate methods to evaluate / Define los tres métodos candidatos que se evaluarán
+
+semilla_imputacion <- 5477976 # Defines a fixed seed for reproducible imputations / Define una semilla fija para obtener imputaciones reproducibles
+
+numero_iteraciones <- 4 # Defines the number of MICE iterations used in the comparison / Define el número de iteraciones de MICE utilizadas en la comparación
+
+```
+
+## **Run candidate imputation methods / Ejecutar métodos candidatos de imputación**
+
+```{r run-candidate-imputation-methods}
+
+# RUN CANDIDATE IMPUTATION METHODS / EJECUTAR MÉTODOS CANDIDATOS DE IMPUTACIÓN
+# ------------------------------------------------------------
+
+resultados_imputacion <- list() # Creates a list to store the results of each method / Crea una lista para almacenar los resultados de cada método
+
+for (nombre_metodo in names(metodos_quantity_comparacion)) {
+  
+  metodo_actual <- metodo_quantity # Copies the previously configured method vector / Copia el vector de métodos configurado previamente
+  
+  metodo_actual["Quantity"] <- metodos_quantity_comparacion[[nombre_metodo]] # Assigns the candidate method to Quantity / Asigna el método candidato a Quantity
+  
+  modelo_actual <- mice::mice(
+    datos_quantity_validacion,
+    m = 1,
+    maxit = numero_iteraciones,
+    method = metodo_actual,
+    predictorMatrix = matriz_quantity,
+    seed = semilla_imputacion,
+    printFlag = FALSE
+  ) # Runs the candidate imputation method using the same predictors and validation data / Ejecuta el método candidato utilizando los mismos predictores y datos de validación
+  
+  datos_completados <- mice::complete(modelo_actual, action = 1) # Extracts the completed dataset generated by MICE / Extrae el conjunto de datos completado generado por MICE
+  
+  resultados_imputacion[[nombre_metodo]] <- datos_completados$Quantity[indices_validacion] # Stores only the imputed values corresponding to the artificial validation sample / Almacena únicamente los valores imputados correspondientes a la muestra de validación artificial
+  
+  cat("Method completed / Método completado:", nombre_metodo, "\n") # Reports completion of each candidate method / Informa la finalización de cada método candidato
+}
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The three candidate methods—PMM, CART, and RF—were successfully executed under the same experimental conditions, using the same predictor matrix, validation sample, random seed, and four MICE iterations. This ensures a consistent and reproducible comparison among methods. Each procedure generated imputed Quantity values for the artificially masked observations, allowing their performance to be evaluated against the known true values. MICE reported three logged events for each method; however, all three procedures completed successfully and produced the values required for the subsequent comparative evaluation.
+
+**Español** {-}
+
+Los tres métodos candidatos—PMM, CART y RF—se ejecutaron correctamente bajo las mismas condiciones experimentales, utilizando la misma matriz de predictores, muestra de validación, semilla aleatoria y cuatro iteraciones de MICE. Esto garantiza una comparación consistente y reproducible entre los métodos. Cada procedimiento generó valores imputados de Quantity para las observaciones ocultadas artificialmente, permitiendo posteriormente comparar su desempeño frente a los valores reales conocidos. MICE registró tres eventos para cada método; sin embargo, los tres procedimientos finalizaron correctamente y generaron los valores necesarios para la evaluación comparativa posterior.
+
+
+# **EVALUATE IMPUTATION PERFORMANCE / EVALUAR DESEMPEÑO DE LA IMPUTACIÓN**
+
+## **Calculate validation metrics / Calcular métricas de validación**
+
+```{r}
+
+# CALCULATE VALIDATION METRICS / CALCULAR MÉTRICAS DE VALIDACIÓN
+# ------------------------------------------------------------
+
+calcular_metricas_quantity <- function(real, estimado, metodo) {
+  
+  tibble::tibble(
+    Metodo = metodo,
+    Accuracy_Exacta = mean(estimado == real), # Calculates exact accuracy / Calcula la exactitud exacta
+    Accuracy_Mas_Menos_1 = mean(abs(estimado - real) <= 1), # Calculates accuracy within one unit / Calcula la exactitud con tolerancia de una unidad
+    Accuracy_Mas_Menos_2 = mean(abs(estimado - real) <= 2), # Calculates accuracy within two units / Calcula la exactitud con tolerancia de dos unidades
+    MAE = mean(abs(estimado - real)), # Calculates mean absolute error / Calcula el error absoluto medio
+    MedAE = median(abs(estimado - real)), # Calculates median absolute error / Calcula la mediana del error absoluto
+    RMSE = sqrt(mean((estimado - real)^2)), # Calculates root mean squared error / Calcula la raíz del error cuadrático medio
+    Sesgo = mean(estimado - real), # Calculates systematic bias / Calcula el sesgo sistemático
+    Minimo = min(estimado), # Reports the minimum imputed value / Informa el valor mínimo imputado
+    Maximo = max(estimado) # Reports the maximum imputed value / Informa el valor máximo imputado
+  )
+}
+
+tabla_comparacion_quantity <- dplyr::bind_rows(
+  calcular_metricas_quantity(valores_reales_quantity, resultados_imputacion$PMM, "PMM"),
+  calcular_metricas_quantity(valores_reales_quantity, resultados_imputacion$CART, "CART"),
+  calcular_metricas_quantity(valores_reales_quantity, resultados_imputacion$RF, "RF")
+) # Combines the metrics obtained for the three methods / Combina las métricas obtenidas para los tres métodos
+
+tabla_comparacion_quantity <- tabla_comparacion_quantity %>%
+  dplyr::mutate(
+    dplyr::across(
+      c(Accuracy_Exacta, Accuracy_Mas_Menos_1, Accuracy_Mas_Menos_2),
+      ~ round(.x * 100, 2)
+    ),
+    dplyr::across(
+      c(MAE, MedAE, RMSE, Sesgo),
+      ~ round(.x, 3)
+    )
+  ) # Formats accuracy as percentages and error metrics for interpretation / Formatea la exactitud como porcentaje y las métricas de error para su interpretación
+
+tabla_comparacion_quantity # Displays the final comparison table / Presenta la tabla comparativa final
+
+```
+
+# **VALIDATE QUANTITY DISTRIBUTION / VALIDAR DISTRIBUCIÓN DE QUANTITY**
+
+## **display complete comparison / mostrar comparación completa**
+
+```{r}
+
+# DISPLAY COMPLETE COMPARISON / MOSTRAR COMPARACIÓN COMPLETA
+# ------------------------------------------------------------
+
+print(tabla_comparacion_quantity, width = Inf) # Displays all validation metrics without truncating columns / Presenta todas las métricas de validación sin truncar columnas
+
+```
+
+## **compare real and pmm distributions / comparar distribuciones real y pmm**
+
+```{r compare-real-pmm-distributions}
+
+# COMPARE REAL AND PMM DISTRIBUTIONS / COMPARAR DISTRIBUCIONES REAL Y PMM
+# ------------------------------------------------------------
+
+comparacion_distribucion_pmm <- dplyr::bind_rows(
+  tibble::tibble(
+    Quantity = valores_reales_quantity,
+    Grupo = "REAL / REAL"
+  ),
+  tibble::tibble(
+    Quantity = resultados_imputacion$PMM,
+    Grupo = "PMM / PMM"
+  )
+) # Combines true and PMM-imputed validation values / Combina los valores reales y los imputados mediante PMM
+
+resumen_distribucion_pmm <- comparacion_distribucion_pmm %>%
+  dplyr::group_by(Grupo) %>%
+  dplyr::summarise(
+    N = dplyr::n(),
+    Media = mean(Quantity),
+    Mediana = median(Quantity),
+    Desviacion_Estandar = sd(Quantity),
+    Minimo = min(Quantity),
+    Maximo = max(Quantity),
+    .groups = "drop"
+  ) # Calculates distributional statistics for true and imputed values / Calcula estadísticas de distribución para los valores reales e imputados
+
+resumen_distribucion_pmm <- resumen_distribucion_pmm %>%
+  dplyr::mutate(
+    dplyr::across(
+      c(Media, Mediana, Desviacion_Estandar),
+      ~ round(.x, 3)
+    )
+  ) # Rounds the main distributional statistics / Redondea las principales estadísticas de distribución
+
+print(resumen_distribucion_pmm, width = Inf) # Displays the distributional comparison / Presenta la comparación de las distribuciones
+
+```
+
+### **g03. real vs pmm quantity distribution / distribución real vs pmm de quantity** {-}
+
+```{r g03-real-vs-pmm-quantity}
+
+# G03. REAL VS PMM QUANTITY DISTRIBUTION / DISTRIBUCIÓN REAL VS PMM DE QUANTITY
+# ------------------------------------------------------------
+
+frecuencias_pmm <- comparacion_distribucion_pmm %>%
+  dplyr::count(Grupo, Quantity, name = "Frecuencia") %>%
+  dplyr::group_by(Grupo) %>%
+  dplyr::mutate(
+    Porcentaje = Frecuencia / sum(Frecuencia) * 100
+  ) %>%
+  dplyr::ungroup() # Calculates frequencies and percentages for each Quantity value / Calcula frecuencias y porcentajes para cada valor de Quantity
+
+grafico_distribucion_pmm <- ggplot2::ggplot(
+  frecuencias_pmm,
+  ggplot2::aes(x = factor(Quantity), y = Porcentaje, fill = Grupo)
+) +
+  ggplot2::geom_col(
+    position = ggplot2::position_dodge(width = 0.8),
+    width = 0.7
+  ) + # Compares real and PMM percentages for every Quantity value / Compara los porcentajes reales y de PMM para cada valor de Quantity
+  ggplot2::geom_text(
+    ggplot2::aes(label = sprintf("%.1f%%", Porcentaje)),
+    position = ggplot2::position_dodge(width = 0.8),
+    vjust = -0.35,
+    size = 3
+  ) + # Displays percentages above each bar / Muestra los porcentajes sobre cada barra
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(frecuencias_pmm$Porcentaje) * 1.20),
+    labels = function(x) paste0(x, "%")
+  ) + # Formats the vertical axis as percentages / Formatea el eje vertical como porcentaje
+  ggplot2::labs(
+    title = "REAL VS PMM QUANTITY DISTRIBUTION / DISTRIBUCIÓN REAL VS PMM DE QUANTITY",
+    subtitle = "ARTIFICIAL VALIDATION SAMPLE / MUESTRA DE VALIDACIÓN ARTIFICIAL",
+    x = "QUANTITY / CANTIDAD",
+    y = "PERCENTAGE / PORCENTAJE",
+    fill = "GROUP / GRUPO"
+  ) + # Defines bilingual chart labels / Define las etiquetas bilingües del gráfico
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold"),
+    plot.subtitle = ggplot2::element_text(face = "bold"),
+    axis.title = ggplot2::element_text(face = "bold"),
+    panel.grid.minor = ggplot2::element_blank()
+  ) # Formats the chart for the report / Formatea el gráfico para el informe
+
+print(grafico_distribucion_pmm) # Displays the distributional comparison / Presenta la comparación de distribuciones
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The comparative validation shows that PMM provides the most balanced performance for Quantity imputation. Although CART achieves a slightly higher exact accuracy (10.1% versus 9.52% for PMM), PMM performs better under the remaining error criteria, with the highest accuracy within ±1 (29.8%) and ±2 units (47.5%), the lowest MAE (3.20) and RMSE (3.98), and an almost null bias (−0.016). All three methods generated values within the valid observed range of 1 to 10.
+
+The distributional comparison further supports PMM: the imputed and real validation samples have nearly identical means (5.64 vs. 5.66), the same median (6), similar standard deviations (2.78 vs. 2.86), and the same range (1–10). Although differences are observed in some individual frequencies, particularly for quantities 2, 3, 5, and 7, the overall distributional characteristics are reasonably preserved. Therefore, PMM is selected as the method for the final imputation of the 604 missing Quantity values, recognizing that its main strength is distributional preservation rather than exact individual prediction.
+
+**Español** {-}
+
+La validación comparativa muestra que PMM presenta el desempeño más equilibrado para la imputación de Quantity. Aunque CART obtiene una exactitud exacta ligeramente superior (10,1 % frente a 9,52 % de PMM), PMM presenta mejores resultados en los demás criterios de error, con la mayor exactitud dentro de ±1 (29,8 %) y ±2 unidades (47,5 %), el menor MAE (3,20) y RMSE (3,98), y un sesgo prácticamente nulo (−0,016). Los tres métodos generaron valores dentro del rango válido observado de 1 a 10.
+
+La comparación distributiva también respalda a PMM: las muestras imputada y real presentan medias prácticamente iguales (5,64 frente a 5,66), la misma mediana (6), desviaciones estándar similares (2,78 frente a 2,86) y el mismo rango (1–10). Aunque se observan diferencias en algunas frecuencias individuales, especialmente para las cantidades 2, 3, 5 y 7, las características generales de la distribución se conservan razonablemente. Por tanto, se selecciona PMM para la imputación definitiva de los 604 valores faltantes de Quantity, reconociendo que su principal fortaleza es la preservación de la distribución y no la predicción exacta de cada valor individual.
+
+
+# **FINAL QUANTITY IMPUTATION / IMPUTACIÓN DEFINITIVA DE QUANTITY**
+
+## **Configure final pmm imputation / Configurar imputación definitiva con pmm**
+
+```{r configure-final-pmm-imputation}
+
+# CONFIGURE FINAL PMM IMPUTATION / CONFIGURAR IMPUTACIÓN DEFINITIVA CON PMM
+# ------------------------------------------------------------
+
+metodo_quantity_final <- metodo_quantity # Copies the previously defined MICE method configuration / Copia la configuración de métodos de MICE definida previamente
+
+metodo_quantity_final["Quantity"] <- "pmm" # Establishes PMM as the final method for Quantity / Establece PMM como método definitivo para Quantity
+
+cat("Final method / Método definitivo:", metodo_quantity_final["Quantity"], "\n") # Reports the selected final method / Informa el método definitivo seleccionado
+cat("Original missing Quantity / Quantity faltantes originales:", sum(is.na(datos_quantity$Quantity)), "\n") # Reports the number of Quantity values to impute / Informa el número de valores de Quantity que se imputarán
+
+```
+
+## **Run final quantity imputation / Ejecutar imputación definitiva de quantity**
+
+```{r run-final-quantity-imputation}
+
+# RUN FINAL QUANTITY IMPUTATION / EJECUTAR IMPUTACIÓN DEFINITIVA DE QUANTITY
+# ------------------------------------------------------------
+
+modelo_quantity_final <- mice::mice(
+  datos_quantity,
+  m = 1,
+  maxit = numero_iteraciones,
+  method = metodo_quantity_final,
+  predictorMatrix = matriz_quantity,
+  seed = semilla_imputacion,
+  printFlag = FALSE
+) # Imputes the 604 original missing Quantity values using the selected PMM model / Imputa los 604 valores faltantes originales de Quantity mediante el modelo PMM seleccionado
+
+datos_quantity_completos <- mice::complete(modelo_quantity_final, action = 1) # Extracts the completed dataset after final PMM imputation / Extrae el conjunto de datos completado después de la imputación definitiva con PMM
+
+cat("Missing Quantity after imputation / Quantity faltantes después de la imputación:", sum(is.na(datos_quantity_completos$Quantity)), "\n") # Verifies that no Quantity values remain missing / Verifica que no permanezcan valores faltantes en Quantity
+
+```
+
+## **Update quantity in main dataset / Actualizar quantity en el dataset principal**
+
+```{r update-quantity-in-main-dataset}
+
+# UPDATE ONLY ORIGINAL MISSING QUANTITY VALUES / ACTUALIZAR SOLO LOS VALORES FALTANTES ORIGINALES DE QUANTITY
+# ------------------------------------------------------------
+
+quantity_original <- datos$Quantity # Preserves the original Quantity variable before updating the main dataset / Conserva la variable Quantity original antes de actualizar el dataset principal
+
+datos$Quantity[indices_quantity_faltante] <- datos_quantity_completos$Quantity[indices_quantity_faltante] # Replaces only the 604 originally missing Quantity values with PMM imputations / Reemplaza únicamente los 604 valores originalmente faltantes de Quantity con las imputaciones de PMM
+
+valores_observados_preservados <- identical(datos$Quantity[!indices_quantity_faltante], quantity_original[!indices_quantity_faltante]) # Verifies that originally observed Quantity values were not modified / Verifica que los valores originalmente observados de Quantity no fueron modificados
+
+cat("Imputed Quantity values / Valores de Quantity imputados:", sum(indices_quantity_faltante), "\n") # Reports the number of Quantity values recovered / Informa el número de valores de Quantity recuperados
+cat("Remaining missing Quantity / Quantity faltantes restantes:", sum(is.na(datos$Quantity)), "\n") # Reports remaining missing Quantity values / Informa los valores faltantes restantes de Quantity
+cat("Observed values preserved / Valores observados preservados:", valores_observados_preservados, "\n") # Confirms preservation of originally observed values / Confirma la conservación de los valores originalmente observados
+cat("Minimum Quantity / Quantity mínima:", min(datos$Quantity), "\n") # Reports the minimum Quantity after imputation / Informa el valor mínimo de Quantity después de la imputación
+cat("Maximum Quantity / Quantity máxima:", max(datos$Quantity), "\n") # Reports the maximum Quantity after imputation / Informa el valor máximo de Quantity después de la imputación
+
+if (sum(is.na(datos$Quantity)) != 0) stop("ERROR: missing Quantity values remain after imputation / permanecen valores faltantes de Quantity después de la imputación.") # Stops if Quantity still contains missing values / Detiene el proceso si Quantity todavía contiene valores faltantes
+
+if (!valores_observados_preservados) stop("ERROR: originally observed Quantity values were modified / se modificaron valores originalmente observados de Quantity.") # Stops if originally observed values were altered / Detiene el proceso si se alteraron valores originalmente observados de Quantity
+
+if (min(datos$Quantity) < 1 || max(datos$Quantity) > 10) stop("ERROR: Quantity contains values outside the valid range 1-10 / Quantity contiene valores fuera del rango válido 1-10.") # Stops if the valid Quantity domain is violated / Detiene el proceso si se incumple el dominio válido de Quantity
+
+```
+
+## **Verify source file path / verificar ruta del archivo fuente**
+
+```{r verify-source-file-path}
+
+# VERIFY SOURCE FILE PATH / VERIFICAR RUTA DEL ARCHIVO FUENTE
+# ------------------------------------------------------------
+
+cat("Project directory / Directorio del proyecto:", getwd(), "\n") # Displays the current R project directory / Muestra el directorio actual del proyecto
+cat("Source file / Archivo fuente:", ruta_datos, "\n") # Displays the relative path of the source file / Muestra la ruta relativa del archivo fuente
+cat("Absolute path / Ruta absoluta:", normalizePath(ruta_datos, winslash = "/", mustWork = TRUE), "\n") # Displays the complete physical path of the source file / Muestra la ruta física completa del archivo fuente
+cat("File exists / El archivo existe:", file.exists(ruta_datos), "\n") # Verifies that the source file exists / Verifica que el archivo fuente exista
+
+```
+
+## **verify integrated dataset / verificar dataset integrado**
+
+```{r verify-integrated-dataset}
+
+# VERIFY INTEGRATED DATASET / VERIFICAR DATASET INTEGRADO
+# ------------------------------------------------------------
+
+cat("Records / Registros:", nrow(datos), "\n") # Reports the number of records after integration / Informa el número de registros después de la integración
+cat("Variables / Variables:", ncol(datos), "\n") # Reports the number of variables after integration / Informa el número de variables después de la integración
+cat("Missing Quantity / Quantity faltantes:", sum(is.na(datos$Quantity)), "\n") # Verifies the final missing values in Quantity / Verifica los valores faltantes finales de Quantity
+cat("Imputed Quantity records / Registros de Quantity imputados:", sum(indices_quantity_faltante), "\n") # Reports the number of originally missing values replaced / Informa el número de valores originalmente faltantes reemplazados
+cat("Observed Quantity preserved / Quantity observados preservados:", valores_observados_preservados, "\n") # Verifies that observed values were not modified / Verifica que los valores observados no fueron modificados
+
+names(datos) # Displays all variables currently contained in the integrated dataset / Presenta todas las variables contenidas actualmente en el dataset integrado
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The final Quantity imputation was successfully completed using PMM (Predictive Mean Matching). All 604 originally missing values were recovered, reducing missingness in Quantity to zero. The 11,971 originally observed values were preserved without modification, confirming that the procedure affected only the records requiring imputation. The resulting values remain within the valid observed domain of 1 to 10, satisfying the established consistency constraints.
+
+The integration into the main dataset was also verified successfully. The working dataset contains 12,575 records and 13 variables, including the original variables and the derived temporal variables Anio and Mes. The source Parquet file was correctly located and verified at data/processed/retail_sales_pre_imputation.parquet. Therefore, the Quantity imputation and its integration into the working dataset are complete and internally consistent. The next stage is the deterministic reconstruction of the 604 missing Total Spent values using Price Per Unit × Quantity.
+
+**Español** {-}
+
+La imputación definitiva de Quantity se completó correctamente mediante PMM (Predictive Mean Matching). Se recuperaron los 604 valores originalmente faltantes, reduciendo a cero los valores faltantes de Quantity. Los 11.971 valores originalmente observados se conservaron sin modificaciones, confirmando que el procedimiento afectó únicamente los registros que requerían imputación. Además, los valores resultantes permanecen dentro del dominio válido observado de 1 a 10, cumpliendo las restricciones de consistencia establecidas.
+
+La integración en el dataset principal también fue verificada satisfactoriamente. El conjunto de trabajo contiene 12.575 registros y 13 variables, incluyendo las variables originales y las variables temporales derivadas Anio y Mes. Asimismo, se confirmó correctamente la existencia del archivo Parquet fuente en data/processed/retail_sales_pre_imputation.parquet. Por tanto, la imputación de Quantity y su integración en el dataset de trabajo quedan finalizadas y son internamente consistentes. La siguiente etapa corresponde a la reconstrucción determinística de los 604 valores faltantes de Total Spent mediante Price Per Unit × Quantity.
+
+# **CALCULATE TOTAL SPENT / CALCULAR TOTAL SPENT**
+
+## **Create calculated total spent variable / Crear variable total spent calculada**
+
+```{r create-calculated-total-spent-variable}
+
+# CREATE CALCULATED TOTAL SPENT VARIABLE / CREAR VARIABLE TOTAL SPENT CALCULADA
+# ------------------------------------------------------------
+
+datos <- datos %>%
+  dplyr::mutate(
+    `Total Spent Calc` = `Price Per Unit` * Quantity
+  ) # Calculates Total Spent from Price Per Unit and Quantity for every record / Calcula Total Spent a partir de Price Per Unit y Quantity para todos los registros
+
+cat("Records / Registros:", nrow(datos), "\n") # Reports the total number of records / Informa el número total de registros
+cat("Variables / Variables:", ncol(datos), "\n") # Reports the number of variables after creating Total Spent Calc / Informa el número de variables después de crear Total Spent Calc
+cat("Missing Price Per Unit / Price Per Unit faltantes:", sum(is.na(datos$`Price Per Unit`)), "\n") # Verifies missing values in Price Per Unit / Verifica los valores faltantes de Price Per Unit
+cat("Missing Quantity / Quantity faltantes:", sum(is.na(datos$Quantity)), "\n") # Verifies missing values in Quantity / Verifica los valores faltantes de Quantity
+cat("Missing Total Spent Calc / Total Spent Calc faltantes:", sum(is.na(datos$`Total Spent Calc`)), "\n") # Verifies whether the calculated variable is complete / Verifica si la variable calculada está completa
+
+```
+
+## **verify calculated total spent / verificar total spent calculado**
+
+```{r verify-calculated-total-spent}
+
+# VERIFY CALCULATED TOTAL SPENT / VERIFICAR TOTAL SPENT CALCULADO
+# ------------------------------------------------------------
+
+cat("Minimum Total Spent Calc / Total Spent Calc mínimo:", min(datos$`Total Spent Calc`), "\n") # Reports the minimum calculated value / Informa el valor calculado mínimo
+cat("Maximum Total Spent Calc / Total Spent Calc máximo:", max(datos$`Total Spent Calc`), "\n") # Reports the maximum calculated value / Informa el valor calculado máximo
+
+datos %>%
+  dplyr::select(
+    `Transaction ID`,
+    `Price Per Unit`,
+    Quantity,
+    `Total Spent`,
+    `Total Spent Calc`
+  ) %>%
+  head(10) # Displays the first ten records for manual verification / Presenta los primeros diez registros para verificación manual
+
+```
+
+## **Inspect dataset structure / Inspeccionar estructura del dataset**
+
+```{r inspect-dataset-structure}
+
+# INSPECT DATASET STRUCTURE / INSPECCIONAR ESTRUCTURA DEL DATASET
+# ------------------------------------------------------------
+
+dplyr::glimpse(datos) # Displays the dimensions, variable names, data types, and sample values of the current dataset / Muestra las dimensiones, nombres de variables, tipos de datos y valores de ejemplo del dataset actual
+
+```
+
+# **Audit total spent calculation / Auditar cálculo de total spent**
+
+```{r audit-total-spent-calculation}
+
+# AUDIT TOTAL SPENT CALCULATION / AUDITAR CÁLCULO DE TOTAL SPENT
+# ------------------------------------------------------------
+
+indices_total_observado <- !is.na(datos$`Total Spent`) # Identifies records with an observed original Total Spent / Identifica registros con Total Spent original observado
+
+diferencia_total_spent <- abs(
+  datos$`Total Spent`[indices_total_observado] -
+  datos$`Total Spent Calc`[indices_total_observado]
+) # Calculates the absolute difference between original and calculated values / Calcula la diferencia absoluta entre los valores originales y calculados
+
+coincidencias_total_spent <- sum(diferencia_total_spent <= 1e-8) # Counts matching observed values / Cuenta los valores observados coincidentes
+
+inconsistencias_total_spent <- sum(diferencia_total_spent > 1e-8) # Counts arithmetic inconsistencies / Cuenta las inconsistencias aritméticas
+
+total_spent_recuperables <- sum(
+  is.na(datos$`Total Spent`) &
+  !is.na(datos$`Total Spent Calc`)
+) # Counts original missing values with an available calculated value / Cuenta los valores originalmente faltantes que disponen de un valor calculado
+
+cat("Observed Total Spent / Total Spent observados:", sum(indices_total_observado), "\n")
+cat("Matching values / Valores coincidentes:", coincidencias_total_spent, "\n")
+cat("Arithmetic inconsistencies / Inconsistencias aritméticas:", inconsistencias_total_spent, "\n")
+cat("Original missing Total Spent / Total Spent original faltante:", sum(is.na(datos$`Total Spent`)), "\n")
+cat("Recoverable with Total Spent Calc / Recuperables con Total Spent Calc:", total_spent_recuperables, "\n")
+
+if (inconsistencias_total_spent != 0) stop("ERROR: arithmetic inconsistencies detected / se detectaron inconsistencias aritméticas.") # Stops execution if inconsistencies are detected / Detiene la ejecución si se detectan inconsistencias
+
+```
+
+## **create total spent comparison table / crear tabla comparativa de total spent**
+
+```{r}
+
+# CREATE TOTAL SPENT COMPARISON TABLE / CREAR TABLA COMPARATIVA DE TOTAL SPENT
+# ------------------------------------------------------------
+
+tabla_total_spent <- datos %>%
+  dplyr::transmute(
+    `Transaction ID`,
+    `Price Per Unit`,
+    Quantity,
+    `Total Spent`,
+    `Total Spent Calc`,
+    `Difference / Diferencia` = `Total Spent` - `Total Spent Calc`,
+    `Status / Estado` = dplyr::case_when(
+      is.na(`Total Spent`) ~ "Missing original / Original faltante",
+      dplyr::near(`Total Spent`, `Total Spent Calc`) ~ "Match / Coincide",
+      TRUE ~ "Mismatch / No coincide"
+    )
+  ) # Creates an auditable comparison table / Crea una tabla comparativa auditable
+
+DT::datatable(
+  tabla_total_spent,
+  rownames = FALSE,
+  filter = "top",
+  options = list(
+    pageLength = 25,
+    lengthMenu = c(10, 25, 50, 100),
+    scrollX = TRUE
+  )
+) # Displays the complete interactive comparison table / Presenta la tabla comparativa interactiva completa
+
+View(tabla_total_spent) # Opens the complete table in the RStudio Data Viewer / Abre la tabla completa en el visor de datos de RStudio
+
+```
+
+## **Export total spent comparison table / Exportar tabla comparativa de total spent**
+
+```{r export-total-spent-comparison-table}
+
+# EXPORT TOTAL SPENT COMPARISON TABLE / EXPORTAR TABLA COMPARATIVA DE TOTAL SPENT
+# ------------------------------------------------------------
+
+ruta_exportacion <- "data/processed" # Defines the output directory / Define el directorio de salida
+
+if (!dir.exists(ruta_exportacion)) dir.create(ruta_exportacion, recursive = TRUE) # Creates the output directory if it does not exist / Crea el directorio de salida si no existe
+
+writexl::write_xlsx(
+  tabla_total_spent,
+  path = file.path(ruta_exportacion, "total_spent_comparison.xlsx")
+) # Exports the comparison table to Excel / Exporta la tabla comparativa a Excel
+
+readr::write_csv(
+  tabla_total_spent,
+  file = file.path(ruta_exportacion, "total_spent_comparison.csv"),
+  na = ""
+) # Exports the comparison table to CSV / Exporta la tabla comparativa a CSV
+
+arrow::write_parquet(
+  tabla_total_spent,
+  sink = file.path(ruta_exportacion, "total_spent_comparison.parquet")
+) # Exports the comparison table to Parquet / Exporta la tabla comparativa a Parquet
+
+cat("XLSX exported / XLSX exportado:", file.exists(file.path(ruta_exportacion, "total_spent_comparison.xlsx")), "\n")
+cat("CSV exported / CSV exportado:", file.exists(file.path(ruta_exportacion, "total_spent_comparison.csv")), "\n")
+cat("Parquet exported / Parquet exportado:", file.exists(file.path(ruta_exportacion, "total_spent_comparison.parquet")), "\n")
+
+sum(is.na(datos$`Total Spent Calc`)) # Counts missing values in Total Spent Calc / Cuenta los valores faltantes de Total Spent Calc
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The deterministic reconstruction of Total Spent was successfully validated. The calculated variable Total Spent Calc, obtained from Price Per Unit × Quantity, contains 12,575 complete values with zero missing records and ranges from 5 to 410.
+
+Among the 11,971 records where the original Total Spent was available, all 11,971 values matched the calculated value, with zero arithmetic inconsistencies. In addition, the 604 originally missing Total Spent values can be completely reconstructed using Total Spent Calc.
+
+These results confirm the deterministic relationship between Price Per Unit, Quantity, and Total Spent in the dataset. Therefore, Total Spent Calc provides a complete and internally consistent reconstruction of the transaction total and can replace the incomplete original variable while maintaining the previous comparison table as an audit trail.
+
+The audit table was also successfully exported to XLSX, CSV, and Parquet, providing reproducible evidence of the reconstruction process.
+
+**Español** {-}
+
+La reconstrucción determinística de Total Spent fue validada satisfactoriamente. La variable calculada Total Spent Calc, obtenida mediante Price Per Unit × Quantity, contiene 12.575 valores completos, sin registros faltantes, y presenta un rango entre 5 y 410.
+
+En los 11.971 registros donde estaba disponible el Total Spent original, los 11.971 valores coincidieron con el valor calculado, registrándose cero inconsistencias aritméticas. Adicionalmente, los 604 valores originalmente faltantes de Total Spent pueden ser reconstruidos completamente mediante Total Spent Calc.
+
+Estos resultados confirman la relación determinística existente entre Price Per Unit, Quantity y Total Spent. Por tanto, Total Spent Calc constituye una reconstrucción completa y aritméticamente consistente del valor total de cada transacción y puede sustituir la variable original incompleta, conservando la tabla comparativa como evidencia de auditoría y trazabilidad.
+
+Finalmente, la tabla de auditoría fue exportada correctamente en formatos XLSX, CSV y Parquet, fortaleciendo la reproducibilidad y trazabilidad del proceso de reconstrucción.
+
+# **CREATE IMPUTED DATABASE / CREAR BASE DE DATOS IMPUTADA**
+
+```{r create-imputed-database}
+
+# CREATE IMPUTED DATABASE / CREAR BASE DE DATOS IMPUTADA
+# ------------------------------------------------------------
+
+datos_imputados <- datos %>%
+  dplyr::select(-`Total Spent`) %>% # Removes the original Total Spent variable / Elimina la variable Total Spent original
+  dplyr::rename(
+    `Total Spent` = `Total Spent Calc`
+  ) # Renames the calculated variable as the definitive Total Spent / Renombra la variable calculada como Total Spent definitiva
+
+cat("Records / Registros:", nrow(datos_imputados), "\n")
+cat("Variables / Variables:", ncol(datos_imputados), "\n")
+cat("Missing Total Spent / Total Spent faltantes:", sum(is.na(datos_imputados$`Total Spent`)), "\n")
+
+```
+
+
+```{r}
+
+# AUDIT MISSING VALUES IN IMPUTED DATABASE / AUDITAR VALORES FALTANTES EN LA BASE IMPUTADA
+# ------------------------------------------------------------
+
+tabla_nulos_imputados <- tibble::tibble(
+  Variable = names(datos_imputados),
+  Faltantes = vapply(datos_imputados, function(x) sum(is.na(x)), integer(1)),
+  Porcentaje = vapply(datos_imputados, function(x) mean(is.na(x)) * 100, numeric(1))
+) %>%
+  dplyr::arrange(dplyr::desc(Faltantes)) # Creates the final missing-value audit / Crea la auditoría final de valores faltantes
+
+print(tabla_nulos_imputados, n = Inf) # Displays all variables / Presenta todas las variables
+
+cat("Total missing values / Total de valores faltantes:", sum(is.na(datos_imputados)), "\n")
+cat("Variables with missing values / Variables con valores faltantes:", sum(tabla_nulos_imputados$Faltantes > 0), "\n")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The reconstructed database contains 12,575 records and 13 variables. The original Total Spent variable was replaced by the deterministically calculated value derived from Price Per Unit × Quantity, resulting in zero missing values in Total Spent.
+
+The missing-data audit confirms that 12 of the 13 variables are complete. The only remaining variable with missing data is Discount Applied, with 4,199 missing values (33.4%). Consequently, the database currently contains 4,199 missing values in total, all concentrated exclusively in this variable.
+
+Therefore, the reconstruction of Quantity and Total Spent is complete. The remaining stage of the missing-data treatment should focus exclusively on evaluating Discount Applied.
+
+**Español** {-}
+
+La base de datos reconstruida contiene 12.575 registros y 13 variables. La variable original Total Spent fue reemplazada por el valor calculado de forma determinística mediante Price Per Unit × Quantity, obteniendo cero valores faltantes en Total Spent.
+
+La auditoría de valores faltantes confirma que 12 de las 13 variables están completas. La única variable que conserva datos faltantes es Discount Applied, con 4.199 valores faltantes (33,4 %). En consecuencia, la base contiene actualmente 4.199 valores faltantes en total, concentrados exclusivamente en esta variable.
+
+Por tanto, el tratamiento de Quantity y la reconstrucción de Total Spent se encuentran completos. La siguiente etapa debe centrarse exclusivamente en evaluar el tratamiento de Discount Applied.
+
+## **Diagnose discount applied / Diagnosticar discount applied**
+
+```{r Diagnose-discount-applied}
+
+# DIAGNOSE DISCOUNT APPLIED / DIAGNOSTICAR DISCOUNT APPLIED
+# ------------------------------------------------------------
+
+resumen_discount <- datos_imputados %>%
+  dplyr::summarise(
+    Registros = dplyr::n(),
+    Observados = sum(!is.na(`Discount Applied`)),
+    Faltantes = sum(is.na(`Discount Applied`)),
+    Verdaderos = sum(`Discount Applied` == TRUE, na.rm = TRUE),
+    Falsos = sum(`Discount Applied` == FALSE, na.rm = TRUE),
+    Porcentaje_Faltantes = mean(is.na(`Discount Applied`)) * 100
+  ) # Summarizes the observed and missing Discount Applied values / Resume los valores observados y faltantes de Discount Applied
+
+print(resumen_discount, width = Inf) # Displays the complete diagnostic summary / Presenta el resumen diagnóstico completo
+
+tabla_discount <- datos_imputados %>%
+  dplyr::filter(!is.na(`Discount Applied`)) %>%
+  dplyr::count(`Discount Applied`, name = "Frecuencia") %>%
+  dplyr::mutate(
+    Porcentaje = Frecuencia / sum(Frecuencia) * 100
+  ) # Calculates the observed TRUE/FALSE distribution / Calcula la distribución observada de TRUE/FALSE
+
+print(tabla_discount, n = Inf) # Displays the observed class distribution / Presenta la distribución de las clases observadas
+
+cat("Observed Discount Applied / Discount Applied observados:", sum(!is.na(datos_imputados$`Discount Applied`)), "\n")
+cat("Missing Discount Applied / Discount Applied faltantes:", sum(is.na(datos_imputados$`Discount Applied`)), "\n")
+cat("Missing percentage / Porcentaje faltante:", round(mean(is.na(datos_imputados$`Discount Applied`)) * 100, 2), "%\n")
+
+```
+
+### **g04. discount applied distribution / distribución de discount applied** {-}
+
+```{r}
+
+# G04. DISCOUNT APPLIED DISTRIBUTION / DISTRIBUCIÓN DE DISCOUNT APPLIED
+# ------------------------------------------------------------
+
+distribucion_discount <- datos_imputados %>%
+  dplyr::mutate(
+    Estado_Discount = dplyr::case_when(
+      is.na(`Discount Applied`) ~ "MISSING / FALTANTE",
+      `Discount Applied` == TRUE ~ "TRUE / VERDADERO",
+      `Discount Applied` == FALSE ~ "FALSE / FALSO"
+    )
+  ) %>%
+  dplyr::count(Estado_Discount, name = "Frecuencia") %>%
+  dplyr::mutate(
+    Porcentaje = Frecuencia / sum(Frecuencia) * 100,
+    Estado_Discount = factor(
+      Estado_Discount,
+      levels = c("FALSE / FALSO", "TRUE / VERDADERO", "MISSING / FALTANTE")
+    )
+  ) # Calculates frequencies and percentages for FALSE, TRUE, and missing values / Calcula frecuencias y porcentajes para FALSE, TRUE y valores faltantes
+
+grafico_discount <- ggplot2::ggplot(
+  distribucion_discount,
+  ggplot2::aes(x = Estado_Discount, y = Frecuencia)
+) +
+  ggplot2::geom_col(width = 0.65) + # Represents the frequency of each Discount Applied status / Representa la frecuencia de cada estado de Discount Applied
+  ggplot2::geom_text(
+    ggplot2::aes(
+      label = paste0(
+        format(Frecuencia, big.mark = ".", decimal.mark = ","),
+        "\n(",
+        format(round(Porcentaje, 1), decimal.mark = ","),
+        "%)"
+      )
+    ),
+    vjust = -0.4,
+    size = 4
+  ) + # Displays frequency and percentage above each bar / Muestra la frecuencia y el porcentaje sobre cada barra
+  ggplot2::scale_y_continuous(
+    limits = c(0, max(distribucion_discount$Frecuencia) * 1.15),
+    labels = function(x) format(x, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  ) + # Formats the frequency axis / Formatea el eje de frecuencias
+  ggplot2::labs(
+    title = "DISCOUNT APPLIED DISTRIBUTION / DISTRIBUCIÓN DE DISCOUNT APPLIED",
+    subtitle = "OBSERVED AND MISSING VALUES / VALORES OBSERVADOS Y FALTANTES",
+    x = NULL,
+    y = "FREQUENCY / FRECUENCIA"
+  ) + # Defines bilingual chart labels / Define las etiquetas bilingües del gráfico
+  ggplot2::theme_minimal(base_size = 12) +
+  ggplot2::theme(
+    plot.title = ggplot2::element_text(face = "bold"),
+    plot.subtitle = ggplot2::element_text(face = "bold"),
+    axis.title = ggplot2::element_text(face = "bold"),
+    panel.grid.minor = ggplot2::element_blank()
+  ) # Formats the chart for the report / Formatea el gráfico para el informe
+
+print(grafico_discount) # Displays the Discount Applied distribution / Presenta la distribución de Discount Applied
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+After reconstructing Total Spent, the working database contains 12,575 records and 13 variables. Quantity and Total Spent are now complete, and the missing-value audit shows that Discount Applied is the only variable that still contains missing data.
+
+Discount Applied contains 8,376 observed values (66.61%) and 4,199 missing values (33.39%). Therefore, all 4,199 remaining missing values in the dataset are concentrated exclusively in this variable.
+
+Among the observed cases, the target variable is almost perfectly balanced: 4,219 TRUE (50.4%) and 4,157 FALSE (49.6%). The difference is only 62 observations, indicating no relevant class imbalance. Consequently, class-balancing techniques are not required at this stage.
+
+The graph also shows that FALSE, TRUE, and missing observations each represent approximately one third of the complete dataset. However, the similar frequency of the three groups does not demonstrate that the missing values can be reliably inferred. Therefore, the next stage should evaluate the predictive information available in the other variables by comparing classification-based imputation methods before imputing the 4,199 missing Discount Applied values.
+
+**Español** {-}
+
+Después de la reconstrucción de Total Spent, la base de trabajo contiene 12.575 registros y 13 variables. Tanto Quantity como Total Spent se encuentran completos, y la auditoría de valores faltantes demuestra que Discount Applied es la única variable que todavía presenta datos faltantes.
+
+Discount Applied contiene 8.376 valores observados (66,61 %) y 4.199 valores faltantes (33,39 %). Por tanto, los 4.199 valores faltantes que permanecen en toda la base de datos están concentrados exclusivamente en esta variable.
+
+Entre los casos observados, la variable objetivo presenta una distribución prácticamente equilibrada: 4.219 TRUE (50,4 %) y 4.157 FALSE (49,6 %). La diferencia es de solamente 62 observaciones, por lo que no existe un problema relevante de desbalance de clases y, en esta etapa, no se requieren técnicas adicionales de balanceo.
+
+La gráfica muestra además que FALSE, TRUE y los valores faltantes representan aproximadamente un tercio de la base completa cada uno. Sin embargo, esta similitud en las frecuencias no significa que los valores faltantes puedan inferirse de manera confiable. El siguiente paso debe evaluar la capacidad predictiva de las demás variables mediante la comparación de métodos de clasificación antes de proceder con la imputación definitiva de los 4.199 valores faltantes de Discount Applied.
+
+## **prepare discount applied modeling data / preparar datos para modelar discount applied**
+
+```{r prepare-discount-applied-modeling}
+
+# PREPARE DISCOUNT APPLIED MODELING DATA / PREPARAR DATOS PARA MODELAR DISCOUNT APPLIED
+# ------------------------------------------------------------
+
+predictoras_discount <- c(
+  "Item",
+  "Quantity",
+  "Total Spent",
+  "Payment Method",
+  "Location",
+  "Anio",
+  "Mes"
+) # Defines the candidate predictors / Define los predictores candidatos
+
+variables_discount <- c(
+  "Discount Applied",
+  predictoras_discount
+) # Defines the target variable and predictors / Define la variable objetivo y los predictores
+
+datos_discount <- datos_imputados %>%
+  dplyr::select(dplyr::all_of(variables_discount)) %>%
+  dplyr::mutate(
+    Item = as.factor(Item),
+    `Payment Method` = as.factor(`Payment Method`),
+    Location = as.factor(Location)
+  ) # Creates the modeling dataset and converts categorical predictors to factors / Crea el dataset de modelado y convierte los predictores categóricos en factores
+
+cat("Modeling records / Registros para modelado:", nrow(datos_discount), "\n")
+cat("Modeling variables / Variables para modelado:", ncol(datos_discount), "\n")
+cat("Observed Discount Applied / Discount Applied observados:", sum(!is.na(datos_discount$`Discount Applied`)), "\n")
+cat("Missing Discount Applied / Discount Applied faltantes:", sum(is.na(datos_discount$`Discount Applied`)), "\n")
+cat("Predictors / Predictores:", paste(predictoras_discount, collapse = ", "), "\n")
+
+```
+
+## **Create stratified validation sample / Crear muestra estratificada de validación**
+
+```{r create-stratified-validation}
+
+# CREATE STRATIFIED VALIDATION SAMPLE / CREAR MUESTRA ESTRATIFICADA DE VALIDACIÓN
+# ------------------------------------------------------------
+
+semilla_validacion_discount <- 5477976 # Defines a reproducible random seed / Define una semilla aleatoria reproducible
+
+proporcion_validacion_discount <- 0.10 # Defines 10% of observed cases for validation / Define el 10 % de los casos observados para validación
+
+indices_discount_false <- which(
+  datos_discount$`Discount Applied` == FALSE &
+  !is.na(datos_discount$`Discount Applied`)
+) # Identifies observed FALSE records / Identifica los registros FALSE observados
+
+indices_discount_true <- which(
+  datos_discount$`Discount Applied` == TRUE &
+  !is.na(datos_discount$`Discount Applied`)
+) # Identifies observed TRUE records / Identifica los registros TRUE observados
+
+numero_validacion_false <- round(
+  length(indices_discount_false) * proporcion_validacion_discount
+) # Calculates the number of FALSE cases to mask / Calcula el número de casos FALSE que se ocultarán
+
+numero_validacion_true <- round(
+  length(indices_discount_true) * proporcion_validacion_discount
+) # Calculates the number of TRUE cases to mask / Calcula el número de casos TRUE que se ocultarán
+
+set.seed(semilla_validacion_discount) # Sets the seed for reproducible sampling / Establece la semilla para un muestreo reproducible
+
+indices_validacion_false <- sample(
+  indices_discount_false,
+  size = numero_validacion_false,
+  replace = FALSE
+) # Selects FALSE validation cases / Selecciona los casos FALSE de validación
+
+indices_validacion_true <- sample(
+  indices_discount_true,
+  size = numero_validacion_true,
+  replace = FALSE
+) # Selects TRUE validation cases / Selecciona los casos TRUE de validación
+
+indices_validacion_discount <- c(
+  indices_validacion_false,
+  indices_validacion_true
+) # Combines both validation classes / Combina ambas clases de validación
+
+valores_reales_discount <- datos_discount$`Discount Applied`[
+  indices_validacion_discount
+] # Preserves the real values before masking / Conserva los valores reales antes del enmascaramiento
+
+datos_discount_validacion <- datos_discount # Creates a validation copy of the modeling dataset / Crea una copia del dataset para validación
+
+datos_discount_validacion$`Discount Applied`[
+  indices_validacion_discount
+] <- NA # Artificially masks the selected observed values / Oculta artificialmente los valores observados seleccionados
+
+```
+
+## **Validate stratified artificial masking / Validar enmascaramiento artificial estratificado**
+
+```{r alidate-stratified-artificial}
+
+# VALIDATE STRATIFIED ARTIFICIAL MASKING / VALIDAR ENMASCARAMIENTO ARTIFICIAL ESTRATIFICADO
+# ------------------------------------------------------------
+
+faltantes_originales_discount <- sum(is.na(datos_discount$`Discount Applied`)) # Counts the original missing values / Cuenta los valores faltantes originales
+
+faltantes_validacion_discount <- sum(is.na(datos_discount_validacion$`Discount Applied`)) # Counts missing values after artificial masking / Cuenta los valores faltantes después del enmascaramiento artificial
+
+numero_casos_validacion_discount <- length(indices_validacion_discount) # Counts artificially masked validation cases / Cuenta los casos de validación ocultados artificialmente
+
+valores_reales_preservados_discount <- identical(
+  valores_reales_discount,
+  datos_discount$`Discount Applied`[indices_validacion_discount]
+) # Verifies that the true validation values were preserved / Verifica que los valores reales de validación fueron preservados
+
+cat("Original missing values / Valores faltantes originales:", faltantes_originales_discount, "\n")
+cat("FALSE validation cases / Casos FALSE de validación:", length(indices_validacion_false), "\n")
+cat("TRUE validation cases / Casos TRUE de validación:", length(indices_validacion_true), "\n")
+cat("Artificial validation cases / Casos de validación artificial:", numero_casos_validacion_discount, "\n")
+cat("Missing values during validation / Valores faltantes durante validación:", faltantes_validacion_discount, "\n")
+cat("True validation values preserved / Valores reales de validación preservados:", valores_reales_preservados_discount, "\n")
+
+if (faltantes_originales_discount != 4199) stop("ERROR: unexpected number of original missing Discount Applied values / número inesperado de valores faltantes originales de Discount Applied.")
+
+if (faltantes_validacion_discount != faltantes_originales_discount + numero_casos_validacion_discount) stop("ERROR: artificial masking validation failed / falló la validación del enmascaramiento artificial.")
+
+if (!valores_reales_preservados_discount) stop("ERROR: true validation values were not preserved / los valores reales de validación no fueron preservados.")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The modeling dataset for Discount Applied was successfully prepared with 12,575 records and 8 variables, consisting of the target variable and seven candidate predictors: Item, Quantity, Total Spent, Payment Method, Location, Anio, and Mes.
+
+Of the 12,575 records, 8,376 have an observed Discount Applied value, while 4,199 remain genuinely missing. These original missing values were preserved and were not used as known outcomes during validation.
+
+A stratified 10% validation sample was successfully generated from the observed cases. This produced 838 artificially masked records, consisting of 416 FALSE and 422 TRUE cases, maintaining the balanced distribution of the target variable.
+
+After artificial masking, the validation dataset contains 5,037 missing values: the 4,199 original missing values plus 838 artificially masked cases. The real outcomes of all 838 validation records were preserved separately, and the validation checks returned TRUE.
+
+Therefore, the validation framework is correctly constructed and reproducible. The 838 masked cases can now serve as an independent reference for comparing classification methods according to their ability to recover known Discount Applied outcomes.
+
+**Español** {-}
+
+La base para modelar Discount Applied fue preparada correctamente con 12.575 registros y 8 variables, correspondientes a la variable objetivo y siete predictores candidatos: Item, Quantity, Total Spent, Payment Method, Location, Anio y Mes.
+
+De los 12.575 registros, 8.376 presentan un valor observado de Discount Applied, mientras que 4.199 permanecen realmente faltantes. Estos valores faltantes originales fueron preservados y no se utilizaron como respuestas conocidas durante la validación.
+
+Se construyó satisfactoriamente una muestra estratificada de validación del 10 % de los casos observados. Se ocultaron artificialmente 838 registros, distribuidos en 416 FALSE y 422 TRUE, conservando prácticamente el equilibrio original de la variable objetivo.
+
+Después del enmascaramiento, la base de validación contiene 5.037 valores faltantes: los 4.199 faltantes originales más los 838 casos ocultados artificialmente. Los valores reales de estos 838 registros fueron conservados independientemente y las verificaciones del procedimiento resultaron satisfactorias (TRUE).
+
+Por tanto, el esquema de validación se encuentra correctamente construido y es reproducible. Los 838 casos ocultados pueden utilizarse ahora como referencia independiente para comparar los métodos de clasificación y determinar qué tan bien recuperan valores conocidos de Discount Applied.
+
+## **Prepare training and validation data / Preparar datos de entrenamiento y validación**
+
+```{r prepare-training-validation}
+
+# PREPARE TRAINING AND VALIDATION DATA / PREPARAR DATOS DE ENTRENAMIENTO Y VALIDACIÓN
+# ------------------------------------------------------------
+
+datos_entrenamiento_discount <- datos_discount_validacion %>%
+  dplyr::filter(!is.na(`Discount Applied`)) %>%
+  dplyr::mutate(
+    `Discount Applied` = factor(`Discount Applied`, levels = c(FALSE, TRUE))
+  ) # Keeps only records with an observed outcome for training / Conserva únicamente registros con respuesta observada para entrenamiento
+
+datos_validacion_discount <- datos_discount[
+  indices_validacion_discount,
+  ,
+  drop = FALSE
+] %>%
+  dplyr::mutate(
+    `Discount Applied` = factor(`Discount Applied`, levels = c(FALSE, TRUE))
+  ) # Creates the validation dataset from artificially masked records / Crea el dataset de validación a partir de los registros ocultados artificialmente
+
+cat("Training records / Registros de entrenamiento:", nrow(datos_entrenamiento_discount), "\n")
+cat("Validation records / Registros de validación:", nrow(datos_validacion_discount), "\n")
+cat("Missing outcomes in training / Respuestas faltantes en entrenamiento:", sum(is.na(datos_entrenamiento_discount$`Discount Applied`)), "\n")
+cat("FALSE validation cases / Casos FALSE de validación:", sum(datos_validacion_discount$`Discount Applied` == FALSE), "\n")
+cat("TRUE validation cases / Casos TRUE de validación:", sum(datos_validacion_discount$`Discount Applied` == TRUE), "\n")
+
+if (nrow(datos_entrenamiento_discount) != 7538) stop("ERROR: unexpected number of training records / número inesperado de registros de entrenamiento.")
+if (nrow(datos_validacion_discount) != 838) stop("ERROR: unexpected number of validation records / número inesperado de registros de validación.")
+if (anyNA(datos_entrenamiento_discount$`Discount Applied`)) stop("ERROR: missing outcomes detected in training data / se detectaron respuestas faltantes en los datos de entrenamiento.")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The computational environment is correctly configured for the model comparison. Both rpart and randomForest are available, allowing CART and Random Forest to be evaluated together with Logistic Regression.
+
+The validation design was successfully implemented. From the 8,376 originally observed Discount Applied values, 7,538 records (90.0%) were retained for model training and 838 records (10.0%) were reserved exclusively for validation.
+
+The validation sample remains highly balanced, containing 416 FALSE cases (49.6%) and 422 TRUE cases (50.4%). In addition, the training dataset contains zero missing target values, confirming that the 4,199 genuinely missing Discount Applied records were excluded from model training and validation.
+
+Therefore, the experimental design is valid for an out-of-sample comparison of Logistic Regression, CART, and Random Forest. All three methods can now be trained on the same 7,538 records and evaluated against the same 838 known outcomes, ensuring a consistent and comparable assessment of their predictive performance.
+
+**Español** {-}
+
+El entorno computacional se encuentra correctamente configurado para realizar la comparación de modelos. Tanto rpart como randomForest están disponibles, lo que permite evaluar CART y Random Forest junto con la Regresión Logística.
+
+El diseño de validación fue implementado satisfactoriamente. De los 8.376 valores originalmente observados de Discount Applied, se conservaron 7.538 registros (90,0 %) para el entrenamiento de los modelos y se reservaron 838 registros (10,0 %) exclusivamente para validación.
+
+La muestra de validación mantiene un alto equilibrio entre las clases, con 416 casos FALSE (49,6 %) y 422 casos TRUE (50,4 %). Además, el conjunto de entrenamiento presenta cero valores faltantes en la variable objetivo, confirmando que los 4.199 valores realmente faltantes de Discount Applied quedaron excluidos tanto del entrenamiento como de la validación.
+
+Por tanto, el diseño experimental es adecuado para realizar una comparación fuera de muestra entre Regresión Logística, CART y Random Forest. Los tres métodos pueden entrenarse sobre los mismos 7.538 registros y evaluarse frente a los mismos 838 valores reales conocidos, garantizando una comparación consistente y metodológicamente controlada.
+
+## **Prepare safe modeling data / Preparar datos seguros para modelado**
+
+```{r prepare-safe-modeling}
+
+# PREPARE SAFE MODELING DATA / PREPARAR DATOS SEGUROS PARA MODELADO
+# ------------------------------------------------------------
+
+datos_entrenamiento_modelos <- datos_entrenamiento_discount %>%
+  dplyr::rename(
+    Discount_Applied = `Discount Applied`,
+    Total_Spent = `Total Spent`,
+    Payment_Method = `Payment Method`
+  ) # Creates a modeling copy with names without spaces / Crea una copia para modelado con nombres sin espacios
+
+datos_validacion_modelos <- datos_validacion_discount %>%
+  dplyr::rename(
+    Discount_Applied = `Discount Applied`,
+    Total_Spent = `Total Spent`,
+    Payment_Method = `Payment Method`
+  ) # Creates the equivalent validation copy / Crea la copia equivalente para validación
+
+cat("Training variables / Variables de entrenamiento:", paste(names(datos_entrenamiento_modelos), collapse = ", "), "\n")
+cat("Validation variables / Variables de validación:", paste(names(datos_validacion_modelos), collapse = ", "), "\n")
+
+```
+
+
+```{r}
+
+# DEFINE CLASSIFICATION FORMULA / DEFINIR FÓRMULA DE CLASIFICACIÓN
+# ------------------------------------------------------------
+
+formula_discount <- Discount_Applied ~ Item + Quantity + Total_Spent + Payment_Method + Location + Anio + Mes # Defines the common classification formula / Define la fórmula común de clasificación
+
+print(formula_discount) # Displays the final formula / Muestra la fórmula definitiva
+
+```
+
+## **Train classification models / Entrenar modelos de clasificación**
+
+```{r}
+# TRAIN CLASSIFICATION MODELS / ENTRENAR MODELOS DE CLASIFICACIÓN
+# ------------------------------------------------------------
+
+modelo_logistico_discount <- stats::glm(
+  formula = formula_discount,
+  data = datos_entrenamiento_modelos,
+  family = stats::binomial(link = "logit")
+) # Trains Logistic Regression / Entrena Regresión Logística
+
+modelo_cart_discount <- rpart::rpart(
+  formula = formula_discount,
+  data = datos_entrenamiento_modelos,
+  method = "class"
+) # Trains CART / Entrena CART
+
+cat("Logistic Regression / Regresión Logística: completed / completada\n")
+cat("CART: completed / completado\n")
+
+# PREPARE RANDOM FOREST MATRIX / PREPARAR MATRIZ PARA RANDOM FOREST
+# ------------------------------------------------------------
+
+formula_rf_discount <- ~ Item + Quantity + Total_Spent + Payment_Method + Location + Anio + Mes # Defines the predictor formula without the target / Define la fórmula de predictores sin la variable objetivo
+
+matriz_entrenamiento_rf <- stats::model.matrix(
+  formula_rf_discount,
+  data = datos_entrenamiento_modelos
+)[, -1, drop = FALSE] # Converts categorical predictors into dummy variables and removes the intercept / Convierte los predictores categóricos en variables dummy y elimina el intercepto
+
+cat("Random Forest training records / Registros de entrenamiento Random Forest:", nrow(matriz_entrenamiento_rf), "\n")
+cat("Random Forest predictor columns / Columnas predictoras Random Forest:", ncol(matriz_entrenamiento_rf), "\n")
+cat("Missing predictor values / Valores predictores faltantes:", sum(is.na(matriz_entrenamiento_rf)), "\n")
+
+if (nrow(matriz_entrenamiento_rf) != nrow(datos_entrenamiento_modelos)) stop("ERROR: Random Forest matrix has an unexpected number of records / la matriz de Random Forest tiene un número inesperado de registros.")
+if (anyNA(matriz_entrenamiento_rf)) stop("ERROR: missing values detected in Random Forest predictors / se detectaron valores faltantes en los predictores de Random Forest.")
+
+# TRAIN RANDOM FOREST / ENTRENAR RANDOM FOREST
+# ------------------------------------------------------------
+
+set.seed(semilla_validacion_discount) # Sets the reproducible seed / Establece la semilla reproducible
+
+modelo_rf_discount <- randomForest::randomForest(
+  x = matriz_entrenamiento_rf,
+  y = datos_entrenamiento_modelos$Discount_Applied,
+  ntree = 500,
+  importance = TRUE
+) # Trains Random Forest using the dummy-encoded predictor matrix / Entrena Random Forest utilizando la matriz de predictores codificada en variables dummy
+
+cat("Random Forest: completed / completado\n")
+cat("Number of trees / Número de árboles:", modelo_rf_discount$ntree, "\n")
+
+# VERIFY TRAINED MODELS / VERIFICAR MODELOS ENTRENADOS
+# ------------------------------------------------------------
+
+modelo_logistico_disponible <- exists("modelo_logistico_discount") # Verifies Logistic Regression / Verifica Regresión Logística
+modelo_cart_disponible <- exists("modelo_cart_discount") # Verifies CART / Verifica CART
+modelo_rf_disponible <- exists("modelo_rf_discount") # Verifies Random Forest / Verifica Random Forest
+
+cat("Logistic Regression available / Regresión Logística disponible:", modelo_logistico_disponible, "\n")
+cat("CART available / CART disponible:", modelo_cart_disponible, "\n")
+cat("Random Forest available / Random Forest disponible:", modelo_rf_disponible, "\n")
+
+if (!all(modelo_logistico_disponible, modelo_cart_disponible, modelo_rf_disponible)) stop("ERROR: one or more classification models were not created / uno o más modelos de clasificación no fueron creados.")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The three classification models were successfully trained using the same 7,538 training records and the same set of seven predictors: Item, Quantity, Total Spent, Payment Method, Location, Anio, and Mes.
+
+Logistic Regression and CART were trained directly from the modeling dataset. For Random Forest, the categorical predictors were transformed into a numerical dummy-encoded matrix because Item contains a large number of categories. This transformation produced 206 predictor columns, preserved all 7,538 training records, and introduced no missing values.
+
+Random Forest was successfully trained with 500 trees, and the final verification confirmed that Logistic Regression, CART, and Random Forest are all available (TRUE). Therefore, the three models are ready to generate predictions on the same 838 validation records.
+
+At this stage, no model can yet be considered superior. Model selection must be based on out-of-sample validation metrics rather than successful model training alone.
+
+**Español** {-}
+
+Los tres modelos de clasificación fueron entrenados satisfactoriamente utilizando los mismos 7.538 registros de entrenamiento y el mismo conjunto de siete predictores: Item, Quantity, Total Spent, Payment Method, Location, Anio y Mes.
+
+La Regresión Logística y CART fueron entrenados directamente sobre la base de modelado. Para Random Forest fue necesario transformar los predictores categóricos en una matriz numérica de variables dummy debido al elevado número de categorías de Item. Esta transformación generó 206 columnas predictoras, conservó los 7.538 registros de entrenamiento y no introdujo ningún valor faltante.
+
+Random Forest fue entrenado correctamente con 500 árboles, y la verificación final confirmó que los tres modelos —Regresión Logística, CART y Random Forest— se encuentran disponibles (TRUE). Por tanto, están preparados para generar predicciones sobre los mismos 838 registros de validación.
+
+En esta etapa todavía no es posible determinar qué modelo presenta mejor desempeño. La selección deberá realizarse mediante métricas de validación fuera de muestra y no únicamente por el hecho de que los modelos hayan sido entrenados correctamente.
+
+## **Prepare validation matrix for random forest / Preparar matriz de validación para random forest**
+
+```{r prepare-validation-matrix}
+
+# PREPARE VALIDATION MATRIX FOR RANDOM FOREST / PREPARAR MATRIZ DE VALIDACIÓN PARA RANDOM FOREST
+# ------------------------------------------------------------
+
+matriz_validacion_rf <- stats::model.matrix(
+  formula_rf_discount,
+  data = datos_validacion_modelos
+)[, -1, drop = FALSE] # Converts validation predictors into dummy variables / Convierte los predictores de validación en variables dummy
+
+columnas_faltantes_rf <- setdiff(
+  colnames(matriz_entrenamiento_rf),
+  colnames(matriz_validacion_rf)
+) # Identifies training columns absent from validation / Identifica columnas de entrenamiento ausentes en validación
+
+if (length(columnas_faltantes_rf) > 0) {
+  matriz_columnas_faltantes <- matrix(
+    0,
+    nrow = nrow(matriz_validacion_rf),
+    ncol = length(columnas_faltantes_rf),
+    dimnames = list(NULL, columnas_faltantes_rf)
+  )
+  matriz_validacion_rf <- cbind(matriz_validacion_rf, matriz_columnas_faltantes)
+} # Adds absent dummy columns with zero values / Agrega con ceros las variables dummy ausentes
+
+columnas_adicionales_rf <- setdiff(
+  colnames(matriz_validacion_rf),
+  colnames(matriz_entrenamiento_rf)
+) # Identifies validation columns absent from training / Identifica columnas de validación ausentes en entrenamiento
+
+if (length(columnas_adicionales_rf) > 0) {
+  matriz_validacion_rf <- matriz_validacion_rf[
+    ,
+    !colnames(matriz_validacion_rf) %in% columnas_adicionales_rf,
+    drop = FALSE
+  ]
+} # Removes validation-only columns / Elimina columnas exclusivas de validación
+
+matriz_validacion_rf <- matriz_validacion_rf[
+  ,
+  colnames(matriz_entrenamiento_rf),
+  drop = FALSE
+] # Forces identical column order between training and validation / Fuerza el mismo orden de columnas entre entrenamiento y validación
+
+cat("Validation records / Registros de validación:", nrow(matriz_validacion_rf), "\n")
+cat("Validation predictor columns / Columnas predictoras de validación:", ncol(matriz_validacion_rf), "\n")
+cat("Training predictor columns / Columnas predictoras de entrenamiento:", ncol(matriz_entrenamiento_rf), "\n")
+cat("Identical predictor structure / Estructura predictora idéntica:", identical(colnames(matriz_entrenamiento_rf), colnames(matriz_validacion_rf)), "\n")
+cat("Missing predictor values / Valores predictores faltantes:", sum(is.na(matriz_validacion_rf)), "\n")
+
+if (nrow(matriz_validacion_rf) != 838) stop("ERROR: unexpected number of validation records / número inesperado de registros de validación.")
+if (!identical(colnames(matriz_entrenamiento_rf), colnames(matriz_validacion_rf))) stop("ERROR: training and validation predictor structures differ / las estructuras predictoras de entrenamiento y validación son diferentes.")
+if (anyNA(matriz_validacion_rf)) stop("ERROR: missing predictor values detected / se detectaron valores faltantes en los predictores.")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The Random Forest validation matrix was successfully constructed with 838 records and 206 predictor columns. Its structure exactly matches the training matrix, which also contains 206 predictor columns.
+
+The validation procedure confirmed an identical predictor structure (TRUE) between training and validation, including the same variables and column order. In addition, no missing predictor values were detected.
+
+Therefore, the validation data are computationally compatible with the trained Random Forest model, ensuring that predictions can be generated on the same 838 records reserved for evaluating Logistic Regression, CART, and Random Forest.
+
+**Español** {-}
+
+La matriz de validación para Random Forest fue construida correctamente con 838 registros y 206 columnas predictoras. Su estructura coincide exactamente con la matriz de entrenamiento, que también contiene 206 columnas predictoras.
+
+La validación confirmó una estructura de predictores idéntica (TRUE) entre entrenamiento y validación, incluyendo las mismas variables y el mismo orden de columnas. Además, se verificó que existen 0 valores faltantes en los predictores.
+
+Por tanto, los datos de validación son computacionalmente compatibles con el modelo Random Forest entrenado y se encuentran preparados para generar predicciones sobre los mismos 838 registros reservados para evaluar Regresión Logística, CART y Random Forest.
+
+## **Generate validation predictions / Generar predicciones de validación**
+
+```{r validation-predictions}
+
+# GENERATE VALIDATION PREDICTIONS / GENERAR PREDICCIONES DE VALIDACIÓN
+# ------------------------------------------------------------
+
+probabilidad_logistica_discount <- stats::predict(
+  modelo_logistico_discount,
+  newdata = datos_validacion_modelos,
+  type = "response"
+) # Predicts TRUE probabilities with Logistic Regression / Predice probabilidades de TRUE mediante Regresión Logística
+
+prediccion_logistica_discount <- factor(
+  probabilidad_logistica_discount >= 0.50,
+  levels = c(FALSE, TRUE)
+) # Converts probabilities into classes using a 0.50 threshold / Convierte probabilidades en clases utilizando un umbral de 0,50
+
+prediccion_cart_discount <- stats::predict(
+  modelo_cart_discount,
+  newdata = datos_validacion_modelos,
+  type = "class"
+) # Predicts validation classes with CART / Predice las clases de validación mediante CART
+
+prediccion_rf_discount <- stats::predict(
+  modelo_rf_discount,
+  newdata = matriz_validacion_rf,
+  type = "response"
+) # Predicts validation classes with Random Forest / Predice las clases de validación mediante Random Forest
+
+valores_reales_discount_factor <- factor(
+  valores_reales_discount,
+  levels = c(FALSE, TRUE)
+) # Converts the preserved real outcomes to the common factor structure / Convierte los valores reales preservados a la estructura factorial común
+
+cat("Logistic predictions / Predicciones Logística:", length(prediccion_logistica_discount), "\n")
+cat("CART predictions / Predicciones CART:", length(prediccion_cart_discount), "\n")
+cat("Random Forest predictions / Predicciones Random Forest:", length(prediccion_rf_discount), "\n")
+cat("Real validation outcomes / Valores reales de validación:", length(valores_reales_discount_factor), "\n")
+
+if (!all(
+  length(prediccion_logistica_discount) == 838,
+  length(prediccion_cart_discount) == 838,
+  length(prediccion_rf_discount) == 838,
+  length(valores_reales_discount_factor) == 838
+)) stop("ERROR: prediction lengths are inconsistent / las longitudes de las predicciones son inconsistentes.")
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+The prediction stage was completed successfully. Logistic Regression, CART, and Random Forest each generated predictions for the 838 validation records, matching exactly the 838 preserved real outcomes.
+
+No inconsistencies in prediction lengths were detected. Therefore, all three models were evaluated on the same validation sample, providing a common and controlled basis for their subsequent performance comparison.
+
+**Español** {-}
+
+La etapa de predicción se completó satisfactoriamente. Regresión Logística, CART y Random Forest generaron predicciones para los 838 registros de validación, coincidiendo exactamente con los 838 valores reales preservados.
+
+No se detectaron inconsistencias en la longitud de las predicciones. Por tanto, los tres modelos fueron aplicados sobre la misma muestra de validación, proporcionando una base común y controlada para comparar posteriormente su desempeño.
+
+# **CALCULATE CLASSIFICATION METRICS / CALCULAR MÉTRICAS DE CLASIFICACIÓN**
+
+```{r classification_metric}
+
+# CALCULATE CLASSIFICATION METRICS / CALCULAR MÉTRICAS DE CLASIFICACIÓN
+# ------------------------------------------------------------
+
+calcular_metricas_discount <- function(reales, predichos, metodo) {
+  
+  reales <- factor(reales, levels = c(FALSE, TRUE)) # Standardizes real classes / Estandariza las clases reales
+  
+  predichos <- factor(predichos, levels = c(FALSE, TRUE)) # Standardizes predicted classes / Estandariza las clases predichas
+  
+  VP <- sum(reales == TRUE & predichos == TRUE) # Counts true positives / Cuenta verdaderos positivos
+  VN <- sum(reales == FALSE & predichos == FALSE) # Counts true negatives / Cuenta verdaderos negativos
+  FP <- sum(reales == FALSE & predichos == TRUE) # Counts false positives / Cuenta falsos positivos
+  FN <- sum(reales == TRUE & predichos == FALSE) # Counts false negatives / Cuenta falsos negativos
+  
+  accuracy <- (VP + VN) / (VP + VN + FP + FN) # Calculates overall accuracy / Calcula la exactitud global
+  
+  sensibilidad <- ifelse(
+    (VP + FN) == 0,
+    NA_real_,
+    VP / (VP + FN)
+  ) # Calculates sensitivity / Calcula la sensibilidad
+  
+  especificidad <- ifelse(
+    (VN + FP) == 0,
+    NA_real_,
+    VN / (VN + FP)
+  ) # Calculates specificity / Calcula la especificidad
+  
+  precision <- ifelse(
+    (VP + FP) == 0,
+    NA_real_,
+    VP / (VP + FP)
+  ) # Calculates precision / Calcula la precisión
+  
+  f1 <- ifelse(
+    is.na(precision) || is.na(sensibilidad) || (precision + sensibilidad) == 0,
+    NA_real_,
+    2 * precision * sensibilidad / (precision + sensibilidad)
+  ) # Calculates F1 score / Calcula la métrica F1
+  
+  balanced_accuracy <- mean(
+    c(sensibilidad, especificidad),
+    na.rm = TRUE
+  ) # Calculates balanced accuracy / Calcula la exactitud balanceada
+  
+  tibble::tibble(
+    Metodo = metodo,
+    Accuracy = accuracy,
+    Sensibilidad = sensibilidad,
+    Especificidad = especificidad,
+    Precision = precision,
+    F1 = f1,
+    Balanced_Accuracy = balanced_accuracy,
+    VP = VP,
+    VN = VN,
+    FP = FP,
+    FN = FN
+  ) # Returns all classification metrics / Devuelve todas las métricas de clasificación
+}
+
+```
+
+## **compare classification models / comparar modelos de clasificación**
+
+```{r compare-classification-models}
+
+# COMPARE CLASSIFICATION MODELS / COMPARAR MODELOS DE CLASIFICACIÓN
+# ------------------------------------------------------------
+
+metricas_logistica_discount <- calcular_metricas_discount(
+  valores_reales_discount_factor,
+  prediccion_logistica_discount,
+  "Logistic Regression"
+) # Evaluates Logistic Regression / Evalúa Regresión Logística
+
+metricas_cart_discount <- calcular_metricas_discount(
+  valores_reales_discount_factor,
+  prediccion_cart_discount,
+  "CART"
+) # Evaluates CART / Evalúa CART
+
+metricas_rf_discount <- calcular_metricas_discount(
+  valores_reales_discount_factor,
+  prediccion_rf_discount,
+  "Random Forest"
+) # Evaluates Random Forest / Evalúa Random Forest
+
+comparacion_modelos_discount <- dplyr::bind_rows(
+  metricas_logistica_discount,
+  metricas_cart_discount,
+  metricas_rf_discount
+) %>%
+  dplyr::mutate(
+    dplyr::across(
+      c(
+        Accuracy,
+        Sensibilidad,
+        Especificidad,
+        Precision,
+        F1,
+        Balanced_Accuracy
+      ),
+      ~ round(.x, 4)
+    )
+  ) # Combines and rounds model performance metrics / Combina y redondea las métricas de desempeño
+
+print(comparacion_modelos_discount, n = Inf, width = Inf)
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+Out-of-sample validation showed that none of the three evaluated models provided useful predictive performance for Discount Applied. Logistic Regression achieved an Accuracy of 49.5% and a Balanced Accuracy of 49.6%; CART achieved 50.4% for both metrics; and Random Forest achieved 48.1%.
+
+The validation sample was nearly balanced, with 422 TRUE and 416 FALSE observations. Therefore, a naive classifier assigning every observation to the majority class (TRUE) would already achieve approximately 50.36% Accuracy. None of the evaluated models provided a meaningful improvement over this reference level.
+
+Consequently, given the available variables, evaluated model specifications, and validation procedure, there is insufficient predictive evidence to reliably recover the 4,199 missing Discount Applied values (33.4%). These values will therefore remain missing rather than being replaced by unsupported predicted values.
+
+This conclusion assumes that the observed Discount Applied records provide a reasonable basis for assessing predictive performance on the missing records. If the missingness mechanism is non-random (MNAR), performance on the missing cases cannot be directly verified.
+
+**Español** {-}
+
+La validación fuera de muestra mostró que ninguno de los tres modelos evaluados presentó una capacidad predictiva útil para Discount Applied. La Regresión Logística obtuvo un Accuracy de 49,5 % y un Balanced Accuracy de 49,6 %; CART obtuvo 50,4 % en ambas métricas; y Random Forest obtuvo 48,1 %.
+
+La muestra de validación estuvo prácticamente equilibrada, con 422 observaciones TRUE y 416 FALSE. Por tanto, un clasificador ingenuo que asignara todas las observaciones a la clase mayoritaria (TRUE) ya alcanzaría aproximadamente 50,36 % de Accuracy. Ninguno de los modelos evaluados produjo una mejora útil frente a este nivel de referencia.
+
+En consecuencia, con las variables disponibles, las especificaciones evaluadas y el procedimiento de validación utilizado, no existe evidencia predictiva suficiente para recuperar de manera confiable los 4.199 valores faltantes de Discount Applied (33,4 %). Por esta razón, estos valores se conservarán como faltantes en lugar de sustituirlos por predicciones sin respaldo empírico suficiente.
+
+Esta conclusión supone que los registros observados de Discount Applied proporcionan una base razonable para evaluar el comportamiento predictivo sobre los registros faltantes. Si el mecanismo de ausencia fuera no aleatorio (MNAR), el desempeño sobre los casos faltantes no podría verificarse directamente.
+
+## **Create clean discount status / Crear estado limpio del descuento**
+
+```{r clean-discount-status}
+
+# CREATE CLEAN DISCOUNT STATUS / CREAR ESTADO LIMPIO DEL DESCUENTO
+# ------------------------------------------------------------
+
+datos_imputados <- datos_imputados %>%
+  dplyr::mutate(
+    Discount_Status = dplyr::case_when(
+      `Discount Applied` == TRUE ~ "TRUE",
+      `Discount Applied` == FALSE ~ "FALSE",
+      is.na(`Discount Applied`) ~ "UNKNOWN"
+    )
+  ) # Creates an explicit three-level status without statistical imputation / Crea un estado explícito de tres niveles sin imputación estadística
+
+cat("Missing Discount_Status / Discount_Status faltantes:", sum(is.na(datos_imputados$Discount_Status)), "\n")
+print(table(datos_imputados$Discount_Status, useNA = "ifany"))
+
+```
+
+**CONCLUSIONS / CONCLUSIONES** {-}
+
+**English** {-}
+
+A new operational variable, Discount_Status, was created to explicitly represent the three possible information states: TRUE, FALSE, and UNKNOWN.
+
+The resulting distribution contains 4,219 TRUE, 4,157 FALSE, and 4,199 UNKNOWN records, with no missing values in Discount_Status.
+
+The UNKNOWN category does not constitute statistical imputation. It explicitly preserves the uncertainty associated with the original missing values of Discount Applied, avoiding the assignment of unsupported TRUE or FALSE values.
+
+**Español** {-}
+
+Se creó una nueva variable operativa, Discount_Status, para representar explícitamente los tres estados posibles de la información: TRUE, FALSE y UNKNOWN.
+
+La distribución resultante contiene 4.219 registros TRUE, 4.157 FALSE y 4.199 UNKNOWN, sin valores faltantes en Discount_Status.
+
+La categoría UNKNOWN no constituye una imputación estadística. Su función es preservar explícitamente la incertidumbre correspondiente a los valores originalmente faltantes de Discount Applied, evitando asignar artificialmente valores TRUE o FALSE.
+
+# **CREATE FINAL DATABASES / CREAR BASES DE DATOS FINALES**
+
+```{r create-final-databases}
+
+# CREATE FINAL DATABASES / CREAR BASES DE DATOS FINALES
+# ------------------------------------------------------------
+
+datos_final_cientifico <- datos_imputados # Preserves the original Discount Applied variable for scientific traceability / Conserva la variable original Discount Applied para trazabilidad científica
+
+datos_final_operacional <- datos_imputados %>%
+  dplyr::select(-`Discount Applied`) # Removes incomplete Discount Applied while preserving Discount_Status / Elimina Discount Applied incompleta conservando Discount_Status
+
+cat("Scientific database created / Base científica creada:", exists("datos_final_cientifico"), "\n")
+cat("Operational database created / Base operacional creada:", exists("datos_final_operacional"), "\n")
+cat("Scientific records / Registros base científica:", nrow(datos_final_cientifico), "\n")
+cat("Operational records / Registros base operacional:", nrow(datos_final_operacional), "\n")
+
+```
+
+## **verify missing values in both final databases / verificar valores faltantes en ambas bases finales**
+
+```{r missing-values}
+
+# VERIFY MISSING VALUES IN BOTH FINAL DATABASES / VERIFICAR VALORES FALTANTES EN AMBAS BASES FINALES
+# ------------------------------------------------------------
+
+resumen_nulos_cientifico <- tibble::tibble(
+  Base = "Scientific / Científica",
+  Variable = names(datos_final_cientifico),
+  Nulos = colSums(is.na(datos_final_cientifico))
+) %>%
+  dplyr::mutate(
+    Porcentaje = round(Nulos / nrow(datos_final_cientifico) * 100, 2)
+  ) # Summarizes missing values in the scientific database / Resume los valores faltantes de la base científica
+
+resumen_nulos_operacional <- tibble::tibble(
+  Base = "Operational / Operacional",
+  Variable = names(datos_final_operacional),
+  Nulos = colSums(is.na(datos_final_operacional))
+) %>%
+  dplyr::mutate(
+    Porcentaje = round(Nulos / nrow(datos_final_operacional) * 100, 2)
+  ) # Summarizes missing values in the operational database / Resume los valores faltantes de la base operacional
+
+resumen_nulos_ambas_bases <- dplyr::bind_rows(
+  resumen_nulos_cientifico,
+  resumen_nulos_operacional
+) %>%
+  dplyr::arrange(dplyr::desc(Nulos), Base, Variable) # Combines both missing-value summaries / Combina los resúmenes de valores faltantes de ambas bases
+
+resumen_general_bases <- tibble::tibble(
+  Base = c(
+    "Scientific / Científica",
+    "Operational / Operacional"
+  ),
+  Registros = c(
+    nrow(datos_final_cientifico),
+    nrow(datos_final_operacional)
+  ),
+  Variables = c(
+    ncol(datos_final_cientifico),
+    ncol(datos_final_operacional)
+  ),
+  Nulos_Totales = c(
+    sum(is.na(datos_final_cientifico)),
+    sum(is.na(datos_final_operacional))
+  ),
+  Variables_Con_Nulos = c(
+    sum(colSums(is.na(datos_final_cientifico)) > 0),
+    sum(colSums(is.na(datos_final_operacional)) > 0)
+  )
+) # Creates a general comparison of both final databases / Crea una comparación general de ambas bases finales
+
+cat("FINAL DATABASE QUALITY SUMMARY / RESUMEN DE CALIDAD DE LAS BASES FINALES\n")
+cat("------------------------------------------------------------\n")
+cat("Scientific records / Registros base científica:", nrow(datos_final_cientifico), "\n")
+cat("Scientific variables / Variables base científica:", ncol(datos_final_cientifico), "\n")
+cat("Scientific missing values / Nulos base científica:", sum(is.na(datos_final_cientifico)), "\n")
+cat("Scientific variables with missing values / Variables con nulos base científica:", sum(colSums(is.na(datos_final_cientifico)) > 0), "\n")
+cat("Operational records / Registros base operacional:", nrow(datos_final_operacional), "\n")
+cat("Operational variables / Variables base operacional:", ncol(datos_final_operacional), "\n")
+cat("Operational missing values / Nulos base operacional:", sum(is.na(datos_final_operacional)), "\n")
+cat("Operational variables with missing values / Variables con nulos base operacional:", sum(colSums(is.na(datos_final_operacional)) > 0), "\n")
+
+cat("\nGENERAL COMPARISON / COMPARACIÓN GENERAL\n")
+print(resumen_general_bases, n = Inf, width = Inf)
+
+cat("\nMISSING VALUES BY VARIABLE / VALORES FALTANTES POR VARIABLE\n")
+print(resumen_nulos_ambas_bases, n = Inf, width = Inf)
+
+```
+
+## **Create and validate final databases / Crear y validar bases de datos finales**
+
+```{r validate-final-databases}
+
+# CREATE AND VALIDATE FINAL DATABASES / CREAR Y VALIDAR BASES DE DATOS FINALES
+# ------------------------------------------------------------
+
+datos_final_cientifico <- datos_imputados # Preserves Discount Applied and Discount_Status for scientific traceability / Conserva Discount Applied y Discount_Status para trazabilidad científica
+
+datos_final_operacional <- datos_imputados %>%
+  dplyr::select(-`Discount Applied`) # Removes incomplete Discount Applied while preserving Discount_Status / Elimina Discount Applied incompleta conservando Discount_Status
+
+cat("FINAL DATABASE CREATION / CREACIÓN DE BASES DE DATOS FINALES\n")
+cat("------------------------------------------------------------\n")
+cat("Scientific database records / Registros base científica:", nrow(datos_final_cientifico), "\n")
+cat("Scientific database variables / Variables base científica:", ncol(datos_final_cientifico), "\n")
+cat("Scientific database missing values / Nulos base científica:", sum(is.na(datos_final_cientifico)), "\n")
+cat("Scientific Discount Applied missing / Discount Applied faltantes base científica:", sum(is.na(datos_final_cientifico$`Discount Applied`)), "\n")
+cat("Scientific Discount_Status missing / Discount_Status faltantes base científica:", sum(is.na(datos_final_cientifico$Discount_Status)), "\n")
+cat("Operational database records / Registros base operacional:", nrow(datos_final_operacional), "\n")
+cat("Operational database variables / Variables base operacional:", ncol(datos_final_operacional), "\n")
+cat("Operational database missing values / Nulos base operacional:", sum(is.na(datos_final_operacional)), "\n")
+cat("Operational Discount_Status missing / Discount_Status faltantes base operacional:", sum(is.na(datos_final_operacional$Discount_Status)), "\n")
+
+if (nrow(datos_final_cientifico) != 12575) stop("ERROR: unexpected number of scientific records / número inesperado de registros científicos.")
+if (nrow(datos_final_operacional) != 12575) stop("ERROR: unexpected number of operational records / número inesperado de registros operacionales.")
+if (nrow(datos_final_cientifico) != nrow(datos_final_operacional)) stop("ERROR: final databases have different numbers of records / las bases finales tienen diferente número de registros.")
+if (!"Discount Applied" %in% names(datos_final_cientifico)) stop("ERROR: Discount Applied is missing from the scientific database / Discount Applied no está presente en la base científica.")
+if (!"Discount_Status" %in% names(datos_final_cientifico)) stop("ERROR: Discount_Status is missing from the scientific database / Discount_Status no está presente en la base científica.")
+if ("Discount Applied" %in% names(datos_final_operacional)) stop("ERROR: Discount Applied is still present in the operational database / Discount Applied todavía está presente en la base operacional.")
+if (!"Discount_Status" %in% names(datos_final_operacional)) stop("ERROR: Discount_Status is missing from the operational database / Discount_Status no está presente en la base operacional.")
+if (sum(is.na(datos_final_cientifico$`Discount Applied`)) != 4199) stop("ERROR: original Discount Applied missingness was altered / se alteraron los valores faltantes originales de Discount Applied.")
+if (sum(is.na(datos_final_cientifico$Discount_Status)) != 0) stop("ERROR: Discount_Status contains missing values in the scientific database / Discount_Status contiene valores faltantes en la base científica.")
+if (sum(is.na(datos_final_operacional$Discount_Status)) != 0) stop("ERROR: Discount_Status contains missing values in the operational database / Discount_Status contiene valores faltantes en la base operacional.")
+if (sum(is.na(datos_final_operacional)) != 0) stop("ERROR: operational database still contains missing values / la base operacional todavía contiene valores faltantes.")
+
+cat("Final database validation / Validación de bases finales: OK\n")
+
+```
+
+**FINAL CONCLUSIONS / CONCLUSIONES FINALES** {-}
+
+**English** {-}
+
+The data cleaning and imputation process was completed while preserving the traceability and integrity of the original information. The final dataset contains 12,575 records, with no records removed during the construction of the final databases.
+
+Missing values in Quantity were addressed through the validated PMM imputation procedure, while Total Spent was reconstructed using the deterministic relationship between Price Per Unit and Quantity. For Discount Applied, Logistic Regression, CART, and Random Forest did not demonstrate sufficient predictive performance to support reliable statistical imputation. Therefore, its 4,199 missing values (33.4%) were not artificially assigned as TRUE or FALSE.
+
+Instead, Discount_Status was created to explicitly represent the three information states: TRUE, FALSE, and UNKNOWN. The UNKNOWN category preserves the uncertainty of the original missing observations and should not be interpreted as statistical imputation.
+
+Two final databases were generated. The scientific database, retail_sales_final_scientific, preserves Discount Applied for traceability and contains 12,575 records, 14 variables, and 4,199 missing values, all corresponding exclusively to Discount Applied. The operational database, retail_sales_final_operational, removes the incomplete Discount Applied variable while retaining Discount_Status; it contains 12,575 records, 13 variables, and zero missing values.
+
+The final automated validation was successfully completed (OK), confirming the expected number of records, the preservation of the scientific missingness structure, the absence of missing values in Discount_Status, and the complete absence of missing values in the operational database.
+
+**Español** {-}
+
+El proceso de limpieza e imputación se completó preservando la trazabilidad y la integridad de la información original. El conjunto de datos final contiene 12.575 registros, sin eliminar observaciones durante la construcción de las bases finales.
+
+Los valores faltantes de Quantity fueron tratados mediante el procedimiento de imputación PMM previamente validado, mientras que Total Spent fue reconstruido utilizando la relación determinística entre Price Per Unit y Quantity. Para Discount Applied, los modelos de Regresión Logística, CART y Random Forest no demostraron capacidad predictiva suficiente para respaldar una imputación estadística confiable. Por esta razón, sus 4.199 valores faltantes (33,4 %) no fueron asignados artificialmente como TRUE o FALSE.
+
+En su lugar, se creó Discount_Status, que representa explícitamente tres estados de información: TRUE, FALSE y UNKNOWN. La categoría UNKNOWN conserva la incertidumbre correspondiente a las observaciones originalmente faltantes y no constituye una imputación estadística.
+
+Se generaron dos bases de datos finales. La base científica, retail_sales_final_scientific, conserva Discount Applied para garantizar la trazabilidad y contiene 12.575 registros, 14 variables y 4.199 valores faltantes, concentrados exclusivamente en Discount Applied. La base operacional, retail_sales_final_operational, elimina la variable incompleta Discount Applied y conserva Discount_Status; contiene 12.575 registros, 13 variables y 0 valores faltantes.
+
+La validación automatizada final terminó satisfactoriamente con estado OK, confirmando que ambas bases mantienen los 12.575 registros, que Discount_Status no contiene valores faltantes y que la base operacional se encuentra completamente libre de valores nulos.
+
+**FINAL DATABASES / BASES DE DATOS FINALES** {-}
+
+**English** {-}
+
+Two final databases were generated to address different analytical and operational requirements.
+
+The Scientific Database preserves the original Discount Applied variable, including its documented missing values, together with Discount_Status. This version maintains the traceability of the original information and is intended for scientific, statistical, and reproducibility purposes.
+
+The Operational Database removes the incomplete Discount Applied variable and retains Discount_Status, where originally missing discount information is explicitly represented as UNKNOWN. This database contains no missing values and is suitable for operational use, dashboards, reporting, and subsequent analytical workflows.
+
+The final databases are exported in both Parquet and CSV formats:
+
+| Database    | File                                     | Path                                                    |
+| ----------- | ---------------------------------------- | ------------------------------------------------------- |
+| Scientific  | `retail_sales_final_scientific.parquet`  | `data/processed/retail_sales_final_scientific.parquet`  |
+| Scientific  | `retail_sales_final_scientific.csv`      | `data/processed/retail_sales_final_scientific.csv`      |
+| Operational | `retail_sales_final_operational.parquet` | `data/processed/retail_sales_final_operational.parquet` |
+| Operational | `retail_sales_final_operational.csv`     | `data/processed/retail_sales_final_operational.csv`     |
+
+
+**Español** {-}
+
+Se generaron dos bases de datos finales para responder a diferentes necesidades científicas y operacionales.
+
+La Base Científica conserva la variable original Discount Applied, incluyendo sus valores faltantes documentados, junto con Discount_Status. Esta versión mantiene la trazabilidad de la información original y está destinada a fines científicos, estadísticos y de reproducibilidad.
+
+La Base Operacional elimina la variable incompleta Discount Applied y conserva Discount_Status, donde la información de descuento originalmente faltante se representa explícitamente mediante UNKNOWN. Esta base no contiene valores faltantes y está preparada para uso operacional, dashboards, reportes y análisis posteriores.
+
+Las bases finales se exportan en formatos Parquet y CSV:
+
+| Base        | Archivo                                  | Ruta                                                    |
+| ----------- | ---------------------------------------- | ------------------------------------------------------- |
+| Científica  | `retail_sales_final_scientific.parquet`  | `data/processed/retail_sales_final_scientific.parquet`  |
+| Científica  | `retail_sales_final_scientific.csv`      | `data/processed/retail_sales_final_scientific.csv`      |
+| Operacional | `retail_sales_final_operational.parquet` | `data/processed/retail_sales_final_operational.parquet` |
+| Operacional | `retail_sales_final_operational.csv`     | `data/processed/retail_sales_final_operational.csv`     |
+
+## **Export and verify final databases / Exportar y verificar bases de datos finales**
+
+```{r export-final-databases}
+
+# EXPORT AND VERIFY FINAL DATABASES / EXPORTAR Y VERIFICAR BASES DE DATOS FINALES
+# ------------------------------------------------------------
+
+directorio_salida <- "data/processed" # Defines the final output directory / Define el directorio final de salida
+
+if (!dir.exists(directorio_salida)) {
+  dir.create(directorio_salida, recursive = TRUE)
+} # Creates the output directory if it does not exist / Crea el directorio de salida si no existe
+
+ruta_cientifico_parquet <- file.path(directorio_salida, "retail_sales_final_scientific.parquet") # Defines scientific Parquet path / Define la ruta Parquet científica
+ruta_cientifico_csv <- file.path(directorio_salida, "retail_sales_final_scientific.csv") # Defines scientific CSV path / Define la ruta CSV científica
+ruta_operacional_parquet <- file.path(directorio_salida, "retail_sales_final_operational.parquet") # Defines operational Parquet path / Define la ruta Parquet operacional
+ruta_operacional_csv <- file.path(directorio_salida, "retail_sales_final_operational.csv") # Defines operational CSV path / Define la ruta CSV operacional
+
+arrow::write_parquet(datos_final_cientifico, ruta_cientifico_parquet) # Exports the scientific database to Parquet / Exporta la base científica a Parquet
+readr::write_csv(datos_final_cientifico, ruta_cientifico_csv, na = "") # Exports the scientific database to CSV preserving missing values / Exporta la base científica a CSV conservando los valores faltantes
+
+arrow::write_parquet(datos_final_operacional, ruta_operacional_parquet) # Exports the operational database to Parquet / Exporta la base operacional a Parquet
+readr::write_csv(datos_final_operacional, ruta_operacional_csv) # Exports the complete operational database to CSV / Exporta la base operacional completa a CSV
+
+archivos_exportados <- c(ruta_cientifico_parquet, ruta_cientifico_csv, ruta_operacional_parquet, ruta_operacional_csv) # Groups the four expected output files / Agrupa los cuatro archivos de salida esperados
+
+archivos_existen <- file.exists(archivos_exportados) # Verifies that all exported files physically exist / Verifica que todos los archivos exportados existan físicamente
+
+cat("FINAL EXPORT VERIFICATION / VERIFICACIÓN DE EXPORTACIÓN FINAL\n")
+cat("------------------------------------------------------------\n")
+cat("Scientific Parquet / Parquet científico:", archivos_existen[1], "\n")
+cat("Scientific CSV / CSV científico:", archivos_existen[2], "\n")
+cat("Operational Parquet / Parquet operacional:", archivos_existen[3], "\n")
+cat("Operational CSV / CSV operacional:", archivos_existen[4], "\n")
+
+if (!all(archivos_existen)) stop("ERROR: one or more final files were not exported / uno o más archivos finales no fueron exportados.")
+
+datos_verificacion_cientifico <- arrow::read_parquet(ruta_cientifico_parquet) # Reloads the exported scientific database / Recarga la base científica exportada
+datos_verificacion_operacional <- arrow::read_parquet(ruta_operacional_parquet) # Reloads the exported operational database / Recarga la base operacional exportada
+
+cat("\nEXPORTED DATABASE VERIFICATION / VERIFICACIÓN DE BASES EXPORTADAS\n")
+cat("------------------------------------------------------------\n")
+cat("Scientific records / Registros base científica:", nrow(datos_verificacion_cientifico), "\n")
+cat("Scientific variables / Variables base científica:", ncol(datos_verificacion_cientifico), "\n")
+cat("Scientific missing values / Nulos base científica:", sum(is.na(datos_verificacion_cientifico)), "\n")
+cat("Operational records / Registros base operacional:", nrow(datos_verificacion_operacional), "\n")
+cat("Operational variables / Variables base operacional:", ncol(datos_verificacion_operacional), "\n")
+cat("Operational missing values / Nulos base operacional:", sum(is.na(datos_verificacion_operacional)), "\n")
+
+if (nrow(datos_verificacion_cientifico) != 12575) stop("ERROR: incorrect number of records in exported scientific database / número incorrecto de registros en la base científica exportada.")
+if (ncol(datos_verificacion_cientifico) != 14) stop("ERROR: incorrect number of variables in exported scientific database / número incorrecto de variables en la base científica exportada.")
+if (sum(is.na(datos_verificacion_cientifico$`Discount Applied`)) != 4199) stop("ERROR: Discount Applied missingness changed after export / los valores faltantes de Discount Applied cambiaron después de la exportación.")
+if (nrow(datos_verificacion_operacional) != 12575) stop("ERROR: incorrect number of records in exported operational database / número incorrecto de registros en la base operacional exportada.")
+if (ncol(datos_verificacion_operacional) != 13) stop("ERROR: incorrect number of variables in exported operational database / número incorrecto de variables en la base operacional exportada.")
+if (sum(is.na(datos_verificacion_operacional)) != 0) stop("ERROR: exported operational database contains missing values / la base operacional exportada contiene valores faltantes.")
+
+cat("\nFINAL PIPELINE STATUS / ESTADO FINAL DEL PIPELINE: OK\n")
+cat("Scientific database / Base científica:", normalizePath(ruta_cientifico_parquet, winslash = "/", mustWork = TRUE), "\n")
+cat("Operational database / Base operacional:", normalizePath(ruta_operacional_parquet, winslash = "/", mustWork = TRUE), "\n")
+
+```
+
+FINAL EXPORT RESULTS / RESULTADOS FINALES DE EXPORTACIÓN {-}
+English {-}
+
+The final export and verification process was completed successfully. All four expected output files were physically created in the data/processed directory in both Parquet and CSV formats.
+
+The exported Scientific Database was reloaded from disk and verified with 12,575 records and 14 variables. It preserves the 4,199 missing values in the original Discount Applied variable, maintaining the traceability of the information and the uncertainty that could not be reliably resolved through statistical modeling.
+
+The exported Operational Database was also reloaded and verified with 12,575 records and 13 variables. It contains zero missing values, since the incomplete original Discount Applied variable was removed while the complete Discount_Status variable was retained.
+
+All structural and missing-value validations were successfully passed. The pipeline therefore finished with the status:
+
+FINAL PIPELINE STATUS: OK
+
+The final files are:
+
+| Database    | Format  | Final file                               |
+| ----------- | ------- | ---------------------------------------- |
+| Scientific  | Parquet | `retail_sales_final_scientific.parquet`  |
+| Scientific  | CSV     | `retail_sales_final_scientific.csv`      |
+| Operational | Parquet | `retail_sales_final_operational.parquet` |
+| Operational | CSV     | `retail_sales_final_operational.csv`     |
+
+The primary Parquet databases are located at:
+
+D:/Proyectos_IA/0_Retail_Store_Sales_Dirty_for_Data_Cleaning/data/processed/retail_sales_final_scientific.parquet
+
+D:/Proyectos_IA/0_Retail_Store_Sales_Dirty_for_Data_Cleaning/data/processed/retail_sales_final_operational.parquet
+
+Español {-}
+
+El proceso final de exportación y verificación se completó satisfactoriamente. Los cuatro archivos esperados fueron creados físicamente en el directorio data/processed, tanto en formato Parquet como en formato CSV.
+
+La Base Científica exportada fue nuevamente cargada desde el disco y verificada con 12.575 registros y 14 variables. Esta conserva los 4.199 valores faltantes de la variable original Discount Applied, manteniendo la trazabilidad de la información y la incertidumbre que no pudo resolverse de manera confiable mediante los modelos estadísticos evaluados.
+
+La Base Operacional también fue cargada nuevamente y verificada con 12.575 registros y 13 variables. Esta base contiene 0 valores faltantes, debido a que se eliminó la variable original incompleta Discount Applied, conservando en su lugar la variable completa Discount_Status.
+
+Todas las validaciones estructurales y de valores faltantes fueron superadas satisfactoriamente. Por tanto, el pipeline finalizó con el estado:
+
+FINAL PIPELINE STATUS: OK
+
+Los archivos finales son:
+
+| Base        | Formato | Archivo final                            |
+| ----------- | ------- | ---------------------------------------- |
+| Científica  | Parquet | `retail_sales_final_scientific.parquet`  |
+| Científica  | CSV     | `retail_sales_final_scientific.csv`      |
+| Operacional | Parquet | `retail_sales_final_operational.parquet` |
+| Operacional | CSV     | `retail_sales_final_operational.csv`     |
+
+Las bases principales en formato Parquet se encuentran en:
+
+D:/Proyectos_IA/0_Retail_Store_Sales_Dirty_for_Data_Cleaning/data/processed/retail_sales_final_scientific.parquet
+
+D:/Proyectos_IA/0_Retail_Store_Sales_Dirty_for_Data_Cleaning/data/processed/retail_sales_final_operational.parquet
