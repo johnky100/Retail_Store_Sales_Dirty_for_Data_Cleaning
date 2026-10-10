@@ -1,4 +1,11 @@
+
+# ============================================================
+# RETAIL STORE SALES - DATA CLEANING AND IMPUTATION
+# Git ignore configuration
+# ============================================================
+
 # DATA DIRECTORY / CARPETA DE DATOS
+# Excluir únicamente la carpeta indicada
 data_Retail_Store_Sales_Dirty_for_Data_Cleaning/
 
 # R / RSTUDIO
@@ -6,6 +13,8 @@ data_Retail_Store_Sales_Dirty_for_Data_Cleaning/
 .RData
 .Rhistory
 .Ruserdata
+.Renviron
+.Rprofile
 
 # PYTHON
 __pycache__/
@@ -13,14 +22,32 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
+env/
+.pytest_cache/
+.mypy_cache/
 
-# SYSTEM FILES
+# CREDENTIALS / CREDENCIALES
+.env
+.env.*
+!.env.example
+credentials.json
+secrets.json
+*.pem
+*.key
+
+# SYSTEM FILES / ARCHIVOS DEL SISTEMA
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# TEMPORARY FILES
+# TEMPORARY FILES / ARCHIVOS TEMPORALES
 *.tmp
+*.temp
 *.log
+*.bak
+*.swp
+~$*
 
-# RSTUDIO PUBLISHING METADATA / METADATOS DE PUBLICACIÓN RSTUDIO
+# RSTUDIO PUBLISHING METADATA
+# METADATOS DE PUBLICACIÓN RSTUDIO
 rsconnect/
